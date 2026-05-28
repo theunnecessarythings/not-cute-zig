@@ -1,0 +1,7 @@
+.{
+    .name = .vector_add_minimal,
+    .version = "0.1.0",
+    .fingerprint = 0xec671c116a41e395,
+    .dependencies = .{},
+    .paths = .{""},
+}
