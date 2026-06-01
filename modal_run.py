@@ -46,6 +46,6 @@ def main(demo: str = "all") -> None:
     Run the not-cute-zig demos on an A10G GPU.
     
     Args:
-        demo: The specific demo to run. Options: "vector-add", "transpose", "ownership", "mma", "streams", "reduction", "batched-mma", "benchmark", "all"
+        demo: The specific demo to run. Options: "vector-add", "transpose", "ownership", "mma", "streams", "reduction", "batched-mma", "pipeline", "epilogue", "flash", "occupancy", "benchmark", "all"
     """
     run_demos.remote([demo])

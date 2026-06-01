@@ -8,6 +8,8 @@ pub const std_options: std.Options = .{
     .log_level = .info,
 };
 
+const demo_list = "vector-add, transpose, ownership, mma, streams, reduction, batched-mma, pipeline, epilogue, occupancy, benchmark, flash, all";
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -19,11 +21,12 @@ pub fn main() !void {
     _ = args.skip(); // skip exe name
     const cmd = args.next() orelse {
         std.log.err("Usage: not-cute-zig <demo_name>", .{});
-        std.log.err("Available demos: vector-add, transpose, ownership, mma, streams, reduction, batched-mma, benchmark, all", .{});
+        std.log.err("Available demos: {s}", .{demo_list});
         return error.MissingCommand;
     };
 
     try cuda.init();
+    defer cuda.deinit();
 
     const module = try cuda.Module.loadData(@embedFile("cuda-module"));
     defer module.unload();
@@ -42,6 +45,14 @@ pub fn main() !void {
         try runReductionDemo(module);
     } else if (std.mem.eql(u8, cmd, "batched-mma")) {
         try runBatchedMma(module);
+    } else if (std.mem.eql(u8, cmd, "pipeline")) {
+        try runPipelinedMma(module);
+    } else if (std.mem.eql(u8, cmd, "epilogue")) {
+        try runEpilogueDemo(module);
+    } else if (std.mem.eql(u8, cmd, "flash")) {
+        try runFlashAttention(module);
+    } else if (std.mem.eql(u8, cmd, "occupancy")) {
+        try runOccupancyDemo();
     } else if (std.mem.eql(u8, cmd, "benchmark")) {
         try runBenchmarkDemo(module);
     } else if (std.mem.eql(u8, cmd, "all")) {
@@ -52,11 +63,184 @@ pub fn main() !void {
         try runStreamsDemo(module);
         try runReductionDemo(module);
         try runBatchedMma(module);
-        try runBenchmarkDemo(module);
+        try runPipelinedMma(module);
+        try runEpilogueDemo(module);
+        try runOccupancyDemo();
     } else {
         std.log.err("Unknown demo: {s}", .{cmd});
         return error.UnknownCommand;
     }
+}
+
+fn runOccupancyDemo() !void {
+    const dev = try cuda.getDevice();
+    const calc = try cuda.OccupancyCalculator.init(dev);
+    calc.printInfo();
+
+    const block_size = 256;
+    const max_blocks_per_sm = @divTrunc(calc.max_threads_per_sm, block_size);
+    const total_concurrent_blocks = max_blocks_per_sm * calc.sm_count;
+
+    std.log.info("--- Occupancy Math ---", .{});
+    std.log.info("For a kernel with block size {}:", .{block_size});
+    std.log.info("  Max Concurrent Blocks/SM: {}", .{max_blocks_per_sm});
+    std.log.info("  Total Concurrent Blocks: {}", .{total_concurrent_blocks});
+    std.log.info("  (Ideal grid size should be a multiple of {})", .{total_concurrent_blocks});
+}
+
+fn runFlashAttention(module: cuda.Module) !void {
+    const seq_len = 16;
+    const head_dim = 16;
+    const len = seq_len * head_dim;
+
+    var q: [len]f16 = undefined;
+    var k: [len]f16 = undefined;
+    var v: [len]f16 = undefined;
+    var o: [len]f32 = undefined;
+
+    for (0..len) |i| {
+        q[i] = @floatFromInt(i % 5);
+        k[i] = @floatFromInt(i % 3);
+        v[i] = @floatFromInt(i % 2);
+    }
+
+    const d_q = try cuda.malloc(f16, len);
+    defer cuda.free(d_q);
+
+    const d_k = try cuda.malloc(f16, len);
+    defer cuda.free(d_k);
+
+    const d_v = try cuda.malloc(f16, len);
+    defer cuda.free(d_v);
+
+    const d_o = try cuda.malloc(f32, len);
+    defer cuda.free(d_o);
+
+    try cuda.memcpy(f16, d_q, &q, .host_to_device);
+    try cuda.memcpy(f16, d_k, &k, .host_to_device);
+    try cuda.memcpy(f16, d_v, &v, .host_to_device);
+
+    const kernel = try module.getFunction("flash_attention_fwd");
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    try kernel.launch(
+        .{
+            .grid_dim = .{ .x = 1 },
+            .block_dim = .{ .x = 32 },
+        },
+        .{ d_q.ptr, d_k.ptr, d_v.ptr, d_o.ptr, seq_len, head_dim, scale },
+    );
+
+    try cuda.memcpy(f32, &o, d_o, .device_to_host);
+
+    std.log.warn("flash attention is experimental: ran simplified 16x16 forward pass without CPU reference validation", .{});
+}
+
+fn runEpilogueDemo(module: cuda.Module) !void {
+    const k_iters = 1;
+    const a_len = config.mma_m * config.mma_k * k_iters;
+    const b_len = config.mma_k * config.mma_n * k_iters;
+    const c_len = config.mma_m * config.mma_n;
+
+    var a: [a_len]f16 = undefined;
+    var b: [b_len]f16 = undefined;
+    var c: [c_len]f32 = undefined;
+    var d: [c_len]f32 = undefined;
+    var expected: [c_len]f32 = undefined;
+
+    fillPipelineInputs(k_iters, &a, &b, &c);
+    computePipelineReference(k_iters, &a, &b, &c, &expected, 1.0, 0.0, .relu);
+
+    const d_a = try cuda.malloc(f16, a_len);
+    defer cuda.free(d_a);
+
+    const d_b = try cuda.malloc(f16, b_len);
+    defer cuda.free(d_b);
+
+    const d_c = try cuda.malloc(f32, c_len);
+    defer cuda.free(d_c);
+
+    const d_d = try cuda.malloc(f32, c_len);
+    defer cuda.free(d_d);
+
+    try cuda.memcpy(f16, d_a, &a, .host_to_device);
+    try cuda.memcpy(f16, d_b, &b, .host_to_device);
+    try cuda.memcpy(f32, d_c, &c, .host_to_device);
+
+    const kernel = try module.getFunction("pipelined_mma_matmul");
+
+    try kernel.launch(
+        .{
+            .grid_dim = .{ .x = 1, .y = 1 },
+            .block_dim = .{ .x = 32 },
+        },
+        .{ d_a.ptr, d_b.ptr, d_c.ptr, d_d.ptr, @as(f32, 1.0), @as(f32, 0.0), a_len, b_len, c_len, k_iters, @as(u32, 1) },
+    );
+
+    try cuda.memcpy(f32, &d, d_d, .device_to_host);
+
+    for (d, expected, 0..) |actual, want, i| {
+        const diff = @abs(actual - want);
+        if (diff > 0.001) {
+            std.log.err("epilogue mismatch at {}: expected {}, got {}, diff {}", .{ i, want, actual, diff });
+            return error.EpilogueMismatch;
+        }
+    }
+
+    std.log.info("epilogue demo OK: ReLU fused successfully", .{});
+}
+
+fn runPipelinedMma(module: cuda.Module) !void {
+    const k_iters = 4;
+    const a_len = config.mma_m * config.mma_k * k_iters;
+    const b_len = config.mma_k * config.mma_n * k_iters;
+    const c_len = config.mma_m * config.mma_n; // C/D are fixed per batch tile
+
+    var a: [a_len]f16 = undefined;
+    var b: [b_len]f16 = undefined;
+    var c: [c_len]f32 = undefined;
+    var d: [c_len]f32 = undefined;
+    var expected: [c_len]f32 = undefined;
+
+    fillPipelineInputs(k_iters, &a, &b, &c);
+    computePipelineReference(k_iters, &a, &b, &c, &expected, 1.0, 0.0, .none);
+
+    const d_a = try cuda.malloc(f16, a_len);
+    defer cuda.free(d_a);
+
+    const d_b = try cuda.malloc(f16, b_len);
+    defer cuda.free(d_b);
+
+    const d_c = try cuda.malloc(f32, c_len);
+    defer cuda.free(d_c);
+
+    const d_d = try cuda.malloc(f32, c_len);
+    defer cuda.free(d_d);
+
+    try cuda.memcpy(f16, d_a, &a, .host_to_device);
+    try cuda.memcpy(f16, d_b, &b, .host_to_device);
+    try cuda.memcpy(f32, d_c, &c, .host_to_device);
+
+    const kernel = try module.getFunction("pipelined_mma_matmul");
+    try kernel.launch(
+        .{
+            .grid_dim = .{ .x = 1, .y = 1 }, // 1 block, 1 batch
+            .block_dim = .{ .x = 32 },
+        },
+        .{ d_a.ptr, d_b.ptr, d_c.ptr, d_d.ptr, @as(f32, 1.0), @as(f32, 0.0), a_len, b_len, c_len, k_iters, @as(u32, 0) },
+    );
+
+    try cuda.memcpy(f32, &d, d_d, .device_to_host);
+
+    for (d, expected, 0..) |actual, want, i| {
+        const diff = @abs(actual - want);
+        if (diff > 0.001) {
+            std.log.err("pipelined mma mismatch at {}: expected {}, got {}, diff {}", .{ i, want, actual, diff });
+            return error.PipelinedMmaMismatch;
+        }
+    }
+
+    std.log.info("pipelined mma OK: {} k-iterations of {}x{}x{}", .{ k_iters, config.mma_m, config.mma_n, config.mma_k });
 }
 
 fn runBatchedMma(module: cuda.Module) !void {
@@ -64,6 +248,29 @@ fn runBatchedMma(module: cuda.Module) !void {
     const a_len = config.mma_m * config.mma_k;
     const b_len = config.mma_k * config.mma_n;
     const c_len = config.mma_m * config.mma_n;
+
+    var a: [a_len * num_batches]f16 = undefined;
+    var b: [b_len * num_batches]f16 = undefined;
+    var c: [c_len * num_batches]f32 = undefined;
+    var d: [c_len * num_batches]f32 = undefined;
+    var expected: [c_len * num_batches]f32 = undefined;
+
+    for (0..num_batches) |batch| {
+        fillMmaInputs(
+            a[batch * a_len ..][0..a_len],
+            b[batch * b_len ..][0..b_len],
+            c[batch * c_len ..][0..c_len],
+            @intCast(batch),
+        );
+        computeMmaReference(
+            a[batch * a_len ..][0..a_len],
+            b[batch * b_len ..][0..b_len],
+            c[batch * c_len ..][0..c_len],
+            expected[batch * c_len ..][0..c_len],
+            1.0,
+            0.0,
+        );
+    }
 
     const d_a = try cuda.malloc(f16, a_len * num_batches);
     defer cuda.free(d_a);
@@ -77,6 +284,10 @@ fn runBatchedMma(module: cuda.Module) !void {
     const d_d = try cuda.malloc(f32, c_len * num_batches);
     defer cuda.free(d_d);
 
+    try cuda.memcpy(f16, d_a, &a, .host_to_device);
+    try cuda.memcpy(f16, d_b, &b, .host_to_device);
+    try cuda.memcpy(f32, d_c, &c, .host_to_device);
+
     const kernel = try module.getFunction("batched_mma_matmul");
     try kernel.launch(
         .{
@@ -85,6 +296,16 @@ fn runBatchedMma(module: cuda.Module) !void {
         },
         .{ d_a.ptr, d_b.ptr, d_c.ptr, d_d.ptr, @as(f32, 1.0), @as(f32, 0.0), a_len, b_len, c_len },
     );
+
+    try cuda.memcpy(f32, &d, d_d, .device_to_host);
+
+    for (d, expected, 0..) |actual, want, i| {
+        const diff = @abs(actual - want);
+        if (diff > 0.001) {
+            std.log.err("batched mma mismatch at {}: expected {}, got {}, diff {}", .{ i, want, actual, diff });
+            return error.BatchedMmaMismatch;
+        }
+    }
 
     std.log.info("batched mma OK: {} batches of {}x{}x{}", .{ num_batches, config.mma_m, config.mma_n, config.mma_k });
 }
@@ -385,8 +606,6 @@ fn runBenchmarkDemo(module: cuda.Module) !void {
 }
 
 fn runMmaMatmul(module: cuda.Module) !void {
-    const a_layout = layout.rowMajor(.{ config.mma_m, config.mma_k });
-    const b_layout = layout.colMajor(.{ config.mma_k, config.mma_n });
     const c_layout = layout.rowMajor(.{ config.mma_m, config.mma_n });
     const a_len = config.mma_m * config.mma_k;
     const b_len = config.mma_k * config.mma_n;
@@ -398,27 +617,10 @@ fn runMmaMatmul(module: cuda.Module) !void {
     var b: [b_len]f16 = undefined;
     var c: [c_len]f32 = undefined;
     var d: [c_len]f32 = undefined;
+    var expected: [c_len]f32 = undefined;
 
-    for (0..config.mma_m) |row| {
-        for (0..config.mma_k) |col| {
-            const value: f32 = @floatFromInt((row + col) % 5);
-            a[a_layout.offset(.{ row, col })] = @floatCast(value * 0.25);
-        }
-    }
-
-    for (0..config.mma_k) |row| {
-        for (0..config.mma_n) |col| {
-            const value: f32 = @floatFromInt((row * 2 + col) % 7);
-            b[b_layout.offset(.{ row, col })] = @floatCast(value * 0.125);
-        }
-    }
-
-    for (0..config.mma_m) |row| {
-        for (0..config.mma_n) |col| {
-            const value: f32 = @floatFromInt((row + col * 3) % 11);
-            c[c_layout.offset(.{ row, col })] = value * 0.03125;
-        }
-    }
+    fillMmaInputs(&a, &b, &c, 0);
+    computeMmaReference(&a, &b, &c, &expected, alpha, beta);
 
     const d_a = try cuda.malloc(f16, a_len);
     defer cuda.free(d_a);
@@ -449,20 +651,14 @@ fn runMmaMatmul(module: cuda.Module) !void {
 
     for (0..config.mma_m) |row| {
         for (0..config.mma_n) |col| {
-            var acc: f32 = 0;
-            for (0..config.mma_k) |kk| {
-                acc += @as(f32, @floatCast(a[a_layout.offset(.{ row, kk })])) *
-                    @as(f32, @floatCast(b[b_layout.offset(.{ kk, col })]));
-            }
-
-            const expected = alpha * acc + beta * c[c_layout.offset(.{ row, col })];
+            const want = expected[c_layout.offset(.{ row, col })];
             const actual = d[c_layout.offset(.{ row, col })];
-            const diff = @abs(expected - actual);
+            const diff = @abs(want - actual);
             if (diff > 0.001) {
                 std.log.err("mma mismatch at ({}, {}): expected {}, got {}, diff {}", .{
                     row,
                     col,
-                    expected,
+                    want,
                     actual,
                     diff,
                 });
@@ -472,4 +668,97 @@ fn runMmaMatmul(module: cuda.Module) !void {
     }
 
     std.log.info("mma matmul OK: {}x{}x{}", .{ config.mma_m, config.mma_n, config.mma_k });
+}
+
+const Epilogue = enum {
+    none,
+    relu,
+};
+
+fn fillMmaInputs(a: []f16, b: []f16, c: []f32, seed: u32) void {
+    const a_layout = layout.rowMajor(.{ config.mma_m, config.mma_k });
+    const b_layout = layout.colMajor(.{ config.mma_k, config.mma_n });
+    const c_layout = layout.rowMajor(.{ config.mma_m, config.mma_n });
+
+    for (0..config.mma_m) |row| {
+        for (0..config.mma_k) |col| {
+            const value: f32 = @floatFromInt((row + col + seed) % 5);
+            a[a_layout.offset(.{ row, col })] = @floatCast(value * 0.25);
+        }
+    }
+
+    for (0..config.mma_k) |row| {
+        for (0..config.mma_n) |col| {
+            const value: f32 = @floatFromInt((row * 2 + col + seed) % 7);
+            b[b_layout.offset(.{ row, col })] = @floatCast(value * 0.125);
+        }
+    }
+
+    for (0..config.mma_m) |row| {
+        for (0..config.mma_n) |col| {
+            const value: f32 = @floatFromInt((row + col * 3 + seed) % 11);
+            c[c_layout.offset(.{ row, col })] = value * 0.03125;
+        }
+    }
+}
+
+fn computeMmaReference(a: []const f16, b: []const f16, c: []const f32, d: []f32, alpha: f32, beta: f32) void {
+    const a_layout = layout.rowMajor(.{ config.mma_m, config.mma_k });
+    const b_layout = layout.colMajor(.{ config.mma_k, config.mma_n });
+    const c_layout = layout.rowMajor(.{ config.mma_m, config.mma_n });
+
+    for (0..config.mma_m) |row| {
+        for (0..config.mma_n) |col| {
+            var acc: f32 = 0;
+            for (0..config.mma_k) |kk| {
+                acc += @as(f32, @floatCast(a[a_layout.offset(.{ row, kk })])) *
+                    @as(f32, @floatCast(b[b_layout.offset(.{ kk, col })]));
+            }
+            d[c_layout.offset(.{ row, col })] = alpha * acc + beta * c[c_layout.offset(.{ row, col })];
+        }
+    }
+}
+
+fn fillPipelineInputs(comptime k_iters: usize, a: *[config.mma_m * config.mma_k * k_iters]f16, b: *[config.mma_k * config.mma_n * k_iters]f16, c: *[config.mma_m * config.mma_n]f32) void {
+    const a_tile_len = config.mma_m * config.mma_k;
+    const b_tile_len = config.mma_k * config.mma_n;
+    const c_len = config.mma_m * config.mma_n;
+
+    for (0..k_iters) |tile| {
+        for (0..a_tile_len) |i| {
+            const value: f32 = @floatFromInt((i + tile) % 5);
+            a[tile * a_tile_len + i] = @floatCast(value * 0.125);
+        }
+        for (0..b_tile_len) |i| {
+            const value: f32 = @floatFromInt((i * 3 + tile) % 7);
+            b[tile * b_tile_len + i] = @floatCast(value * 0.0625);
+        }
+    }
+
+    for (0..c_len) |i| {
+        c[i] = @as(f32, @floatFromInt(i % 13)) * 0.03125;
+    }
+}
+
+fn computePipelineReference(comptime k_iters: usize, a: *const [config.mma_m * config.mma_k * k_iters]f16, b: *const [config.mma_k * config.mma_n * k_iters]f16, c: *const [config.mma_m * config.mma_n]f32, d: *[config.mma_m * config.mma_n]f32, alpha: f32, beta: f32, epilogue: Epilogue) void {
+    const c_layout = layout.rowMajor(.{ config.mma_m, config.mma_n });
+    const a_tile_len = config.mma_m * config.mma_k;
+    const b_tile_len = config.mma_k * config.mma_n;
+
+    for (0..config.mma_m) |row| {
+        for (0..config.mma_n) |col| {
+            var acc: f32 = 0;
+            for (0..k_iters) |tile| {
+                for (0..config.mma_k) |kk| {
+                    const a_idx = tile * a_tile_len + row * config.mma_k + kk;
+                    const b_idx = tile * b_tile_len + kk * config.mma_n + col;
+                    acc += @as(f32, @floatCast(a[a_idx])) * @as(f32, @floatCast(b[b_idx]));
+                }
+            }
+
+            var out = alpha * acc + beta * c[c_layout.offset(.{ row, col })];
+            if (epilogue == .relu) out = @max(0.0, out);
+            d[c_layout.offset(.{ row, col })] = out;
+        }
+    }
 }

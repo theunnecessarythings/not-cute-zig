@@ -43,6 +43,41 @@ pub inline fn nanosleep(clocks: u32) void {
     );
 }
 
+/// Computes the exponential 2^x using the fast approximation instruction.
+pub inline fn ex2_approx(x: f32) f32 {
+    var ret: f32 = undefined;
+    asm volatile ("ex2.approx.ftz.f32 %[ret], %[x];"
+        : [ret] "=f" (ret),
+        : [x] "f" (x),
+    );
+    return ret;
+}
+
+/// Applies a ReLU activation: max(0, x)
+pub inline fn relu(x: f32) f32 {
+    return @max(0.0, x);
+}
+
+/// Applies a Swish/SiLU activation: x * sigmoid(x)
+pub inline fn silu(x: f32) f32 {
+    const log2e = 1.4426950408889634; // log2(e)
+    const exp_x = ex2_approx(x * log2e);
+    return x * (exp_x / (1.0 + exp_x));
+}
+
+/// Applies a fast GeLU approximation activation
+pub inline fn gelu(x: f32) f32 {
+    // 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    // using fast exp2
+    const sqrt_2_over_pi = 0.7978845608;
+    const inner = sqrt_2_over_pi * (x + 0.044715 * x * x * x);
+    const log2e = 1.4426950408889634; // log2(e)
+    // tanh(z) = (exp(2z) - 1) / (exp(2z) + 1)
+    const exp_2z = ex2_approx(2.0 * inner * log2e);
+    const tanh_approx = (exp_2z - 1.0) / (exp_2z + 1.0);
+    return 0.5 * x * (1.0 + tanh_approx);
+}
+
 /// SM80+ asynchronous memory copy from global to shared memory.
 pub const cp_async = struct {
     /// Copies 16 bytes (128 bits) from global to shared memory.

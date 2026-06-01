@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  cpu:
+    name: CPU checks
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Format
+        run: zig fmt --check build.zig src/*.zig
+      - name: Unit tests
+        run: zig build test
+
+  gpu-compile:
+    name: GPU compile ${{ matrix.gpu }}
+    runs-on: ubuntu-22.04
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubuntu22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        gpu:
+          - sm_80
+          - sm_86
+          - sm_89
+    steps:
+      - name: Install runner dependencies
+        run: apt-get update && apt-get install -y ca-certificates git xz-utils
+      - uses: actions/checkout@v4
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+      - name: Compile host and NVPTX artifacts
+        run: zig build -Dgpu=${{ matrix.gpu }} -Dcuda-include-dir=/usr/local/cuda/include -Dcuda-lib-dir=/usr/local/cuda/lib64/stubs

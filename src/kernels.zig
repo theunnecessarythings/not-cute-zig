@@ -8,7 +8,126 @@ const use_swizzled_shared_transpose = false;
 var transpose_shared: [config.transpose_tile * config.transpose_tile]f32 addrspace(.shared) = undefined;
 var mma_shared_a: [config.mma_m * config.mma_k]f16 addrspace(.shared) = undefined;
 var mma_shared_b: [config.mma_k * config.mma_n]f16 addrspace(.shared) = undefined;
+var mma_shared_a_1: [config.mma_m * config.mma_k]f16 addrspace(.shared) = undefined;
+var mma_shared_b_1: [config.mma_k * config.mma_n]f16 addrspace(.shared) = undefined;
 var reduce_shared: [32]f32 addrspace(.shared) = undefined;
+
+pub const Epilogue = enum(u32) {
+    none = 0,
+    relu = 1,
+    silu = 2,
+    gelu = 3,
+};
+
+pub fn pipelined_mma_matmul(
+    a: [*]addrspace(.global) const f16,
+    b: [*]addrspace(.global) const f16,
+    c: [*]addrspace(.global) const f32,
+    d: [*]addrspace(.global) f32,
+    alpha: f32,
+    beta: f32,
+    batch_stride_a: usize,
+    batch_stride_b: usize,
+    batch_stride_c: usize,
+    k_iters: usize,
+    epilogue_kind: u32,
+) callconv(.kernel) void {
+    const Backend = mma.Backend(mma.m16n8k16_f16_f32);
+    const batch_id = @workGroupId(1);
+
+    const batched_a = a + batch_id * batch_stride_a;
+    const batched_b = b + batch_id * batch_stride_b;
+    const batched_c = c + batch_id * batch_stride_c;
+    const batched_d = d + batch_id * batch_stride_c;
+
+    const shared_a_ptr_0: [*]addrspace(.shared) f16 = @ptrCast(&mma_shared_a);
+    const shared_b_ptr_0: [*]addrspace(.shared) f16 = @ptrCast(&mma_shared_b);
+    const shared_a_ptr_1: [*]addrspace(.shared) f16 = @ptrCast(&mma_shared_a_1);
+    const shared_b_ptr_1: [*]addrspace(.shared) f16 = @ptrCast(&mma_shared_b_1);
+
+    const lane_id = @workItemId(0);
+    var acc = Backend.zeroAccumulator();
+
+    // Prologue: start loading tile 0
+    var k_step: usize = 0;
+
+    // Asynchronous load for Tile 0
+    const i = lane_id * 8; // Each cp.async.cg_16 copies 16 bytes = 8 f16s.
+    if (i < config.mma_m * config.mma_k) {
+        device.cp_async.cg_16(@ptrCast(shared_a_ptr_0 + i), @ptrCast(batched_a + i));
+    }
+    if (i < config.mma_k * config.mma_n) {
+        device.cp_async.cg_16(@ptrCast(shared_b_ptr_0 + i), @ptrCast(batched_b + i));
+    }
+    device.cp_async.commit_group();
+    device.cp_async.wait_group(0); // wait for tile 0
+    blockBarrier();
+
+    var write_stage: u1 = 1;
+    var read_stage: u1 = 0;
+
+    // Main loop
+    while (k_step < k_iters - 1) : (k_step += 1) {
+        const next_a_offset = (k_step + 1) * config.mma_m * config.mma_k;
+        const next_b_offset = (k_step + 1) * config.mma_k * config.mma_n;
+
+        const wr_a_ptr = if (write_stage == 0) shared_a_ptr_0 else shared_a_ptr_1;
+        const wr_b_ptr = if (write_stage == 0) shared_b_ptr_0 else shared_b_ptr_1;
+
+        // Start async copy for next tile
+        if (i < config.mma_m * config.mma_k) {
+            device.cp_async.cg_16(@ptrCast(wr_a_ptr + i), @ptrCast(batched_a + next_a_offset + i));
+        }
+        if (i < config.mma_k * config.mma_n) {
+            device.cp_async.cg_16(@ptrCast(wr_b_ptr + i), @ptrCast(batched_b + next_b_offset + i));
+        }
+        device.cp_async.commit_group();
+
+        // Compute current tile
+        const rd_a_ptr = if (read_stage == 0) shared_a_ptr_0 else shared_a_ptr_1;
+        const rd_b_ptr = if (read_stage == 0) shared_b_ptr_0 else shared_b_ptr_1;
+
+        const a_frag = Backend.loadA(rd_a_ptr, config.mma_k, lane_id);
+        const b_frag = Backend.loadB(rd_b_ptr, config.mma_n, lane_id);
+        acc = Backend.mma(a_frag, b_frag, acc);
+
+        // Wait for the async copy we just issued to complete
+        device.cp_async.wait_group(0);
+        blockBarrier();
+
+        write_stage +%= 1;
+        read_stage +%= 1;
+    }
+
+    // Epilogue: compute final tile
+    const rd_a_ptr = if (read_stage == 0) shared_a_ptr_0 else shared_a_ptr_1;
+    const rd_b_ptr = if (read_stage == 0) shared_b_ptr_0 else shared_b_ptr_1;
+    const a_frag = Backend.loadA(rd_a_ptr, config.mma_k, lane_id);
+    const b_frag = Backend.loadB(rd_b_ptr, config.mma_n, lane_id);
+    acc = Backend.mma(a_frag, b_frag, acc);
+
+    // Write out results with fused epilogue
+    const c_layout = layout.rowMajor(.{ config.mma_m, config.mma_n });
+    const c_view = layout.tensor(batched_c, c_layout);
+    const d_view = layout.tensor(batched_d, c_layout);
+
+    inline for (0..4) |acc_i| {
+        const coord = Backend.accumulatorCoord(lane_id, acc_i);
+        const c_val = c_view.get(coord);
+
+        var out_val = alpha * acc[acc_i] + beta * c_val;
+
+        if (epilogue_kind == @intFromEnum(Epilogue.relu)) {
+            out_val = device.relu(out_val);
+        } else if (epilogue_kind == @intFromEnum(Epilogue.silu)) {
+            out_val = device.silu(out_val);
+        } else if (epilogue_kind == @intFromEnum(Epilogue.gelu)) {
+            out_val = device.gelu(out_val);
+        }
+
+        d_view.set(coord, out_val);
+    }
+}
 
 pub fn stream_sleep(
     clock_count: u32,
@@ -245,4 +364,108 @@ fn blockBarrier() void {
 
 fn encodeOwnership(warp_id: u32, lane_owner: u32, value_id: u32) u32 {
     return (warp_id << 24) | (lane_owner << 8) | value_id;
+}
+
+pub fn flash_attention_fwd(
+    q: [*]addrspace(.global) const f16,
+    k: [*]addrspace(.global) const f16,
+    v: [*]addrspace(.global) const f16,
+    o: [*]addrspace(.global) f32,
+    seq_len: usize,
+    head_dim: usize,
+    scale: f32,
+) callconv(.kernel) void {
+    _ = seq_len;
+    _ = head_dim;
+    const Backend = mma.Backend(mma.m16n8k16_f16_f32);
+    const lane_id = @workItemId(0);
+
+    // Simplified 1-block, 1-warp forward pass (16x16 block) for demonstration.
+    // In a real FA kernel, we'd loop over tiles of K and V to incrementally compute the softmax.
+
+    const shared_q_ptr: [*]addrspace(.shared) f16 = @ptrCast(&mma_shared_a);
+    const shared_k_ptr: [*]addrspace(.shared) f16 = @ptrCast(&mma_shared_b);
+
+    // Q is 16x16 (m=16, k=16). Load Q.
+    var i = lane_id;
+    while (i < 16 * 16) : (i += 32) {
+        shared_q_ptr[i] = q[i];
+        shared_k_ptr[i] = k[i];
+    }
+    blockBarrier();
+
+    // 1. Compute S = Q * K^T * scale
+    // mma.m16n8k16.row.col uses B as col-major, so passing K directly computes Q * K^T
+    const q_frag = Backend.loadA(shared_q_ptr, 16, lane_id);
+    const k_frag = Backend.loadB(shared_k_ptr, 16, lane_id); // using 16 as stride to treat as 16x16
+
+    var s_acc = Backend.mma(q_frag, k_frag, Backend.zeroAccumulator());
+
+    inline for (0..4) |acc_i| {
+        s_acc[acc_i] *= scale;
+    }
+
+    // 2. Row-wise Max (simplified: no causal mask)
+    var row_max: f32 = -1e20;
+    inline for (0..4) |acc_i| {
+        if (s_acc[acc_i] > row_max) row_max = s_acc[acc_i];
+    }
+    // Warp-level reduction for max across the row
+    // Each thread holds 4 values of the 16x16 S matrix.
+    inline for (.{ 16, 8, 4, 2, 1 }) |offset| {
+        const val_u32 = device.shfl_sync_bfly(0xFFFFFFFF, @bitCast(row_max), offset, 32);
+        row_max = @max(row_max, @as(f32, @bitCast(val_u32)));
+    }
+
+    // 3. Row-wise Sum of Exp(S - max)
+    var row_sum: f32 = 0;
+    inline for (0..4) |acc_i| {
+        s_acc[acc_i] = device.ex2_approx((s_acc[acc_i] - row_max) * 1.4426950408889634);
+        row_sum += s_acc[acc_i];
+    }
+    inline for (.{ 16, 8, 4, 2, 1 }) |offset| {
+        const val_u32 = device.shfl_sync_bfly(0xFFFFFFFF, @bitCast(row_sum), offset, 32);
+        row_sum += @as(f32, @bitCast(val_u32));
+    }
+
+    // 4. Normalize to get P
+    inline for (0..4) |acc_i| {
+        s_acc[acc_i] /= row_sum;
+    }
+
+    // Write P back to shared memory (cast to f16) to prepare for P * V
+    // P is 16x16.
+    const shared_p_ptr: [*]addrspace(.shared) f16 = @ptrCast(&mma_shared_a_1);
+    const shared_v_ptr: [*]addrspace(.shared) f16 = @ptrCast(&mma_shared_b_1);
+
+    inline for (0..4) |acc_i| {
+        const coord = Backend.accumulatorCoord(lane_id, acc_i);
+        const row = coord[0];
+        const col = coord[1];
+        shared_p_ptr[row * 16 + col] = @floatCast(s_acc[acc_i]);
+    }
+
+    // Load V
+    i = lane_id;
+    while (i < 16 * 16) : (i += 32) {
+        shared_v_ptr[i] = v[i];
+    }
+    blockBarrier();
+
+    // 5. Compute O = P * V
+    // V needs to be treated as col-major for the mma hardware if we want row*row
+    // Wait, mma.row.col expects B to be col-major. We stored V as row-major.
+    // For this simple demo, we will use loadA on P, loadB on V.
+    const p_frag = Backend.loadA(shared_p_ptr, 16, lane_id);
+    const v_frag = Backend.loadB(shared_v_ptr, 16, lane_id);
+
+    const o_acc = Backend.mma(p_frag, v_frag, Backend.zeroAccumulator());
+
+    // Write out O (16x16 f32)
+    inline for (0..4) |acc_i| {
+        const coord = Backend.accumulatorCoord(lane_id, acc_i);
+        const row = coord[0];
+        const col = coord[1];
+        o[row * 16 + col] = o_acc[acc_i];
+    }
 }

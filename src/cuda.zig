@@ -1,6 +1,4 @@
 const std = @import("std");
-const assert = std.debug.assert;
-
 pub const c = struct {
     pub const CUDA_SUCCESS = 0;
     pub const CUDA_ERROR_INVALID_VALUE = 1;
@@ -73,7 +71,23 @@ pub const c = struct {
     pub extern fn cuInit(flags: c_uint) CUresult;
     pub extern fn cuDeviceGetCount(count: *c_int) CUresult;
     pub extern fn cuDeviceGet(device: *CUdevice, ordinal: c_int) CUresult;
+    pub extern fn cuDeviceGetAttribute(pi: *c_int, attrib: CUdevice_attribute, dev: CUdevice) CUresult;
     pub extern fn cuCtxCreate(context: *CUcontext, flags: c_uint, device: CUdevice) CUresult;
+    pub extern fn cuCtxDestroy(context: CUcontext) CUresult;
+
+    pub const CUdevice_attribute = c_uint;
+    pub const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 1;
+    pub const CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_X = 2;
+    pub const CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Y = 3;
+    pub const CU_DEVICE_ATTRIBUTE_MAX_BLOCK_DIM_Z = 4;
+    pub const CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_X = 5;
+    pub const CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Y = 6;
+    pub const CU_DEVICE_ATTRIBUTE_MAX_GRID_DIM_Z = 7;
+    pub const CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK = 8;
+    pub const CU_DEVICE_ATTRIBUTE_WARP_SIZE = 10;
+    pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16;
+    pub const CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK = 12;
+    pub const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR = 39;
     pub extern fn cuCtxSynchronize() CUresult;
     pub extern fn cuStreamCreate(stream: *CUstream, flags: c_uint) CUresult;
     pub extern fn cuStreamDestroy(stream: CUstream) CUresult;
@@ -108,6 +122,7 @@ pub const c = struct {
 /// High-level Zig error set mapped to CUDA driver API errors.
 pub const CudaError = error{
     OutOfMemory,
+    Overflow,
     SharedObjectInitFailed,
     NotFound,
     InvalidValue,
@@ -120,8 +135,11 @@ pub const CudaError = error{
     LaunchTimeout,
     IllegalAddress,
     NoDevice,
+    NotInitialized,
     UnknownError,
 };
+
+var current_context: ?c.CUcontext = null;
 
 /// Validates a CUDA result code and maps it to a standard Zig CudaError.
 pub fn check(err: c.CUresult) CudaError!void {
@@ -143,28 +161,91 @@ pub fn check(err: c.CUresult) CudaError!void {
         c.CUDA_ERROR_LAUNCH_TIMEOUT => error.LaunchTimeout,
         c.CUDA_ERROR_ILLEGAL_ADDRESS => error.IllegalAddress,
         c.CUDA_ERROR_NO_DEVICE => error.NoDevice,
+        c.CUDA_ERROR_NOT_INITIALIZED => error.NotInitialized,
         else => error.UnknownError,
     };
 }
 
 /// Initializes the CUDA driver API. Must be called before any other CUDA functions.
 pub fn init() !void {
+    if (current_context != null) return;
+
     try check(c.cuInit(0));
 
     var count: c_int = undefined;
     try check(c.cuDeviceGetCount(&count));
+    if (count <= 0) return error.NoDevice;
 
     var device: c.CUdevice = undefined;
     try check(c.cuDeviceGet(&device, 0));
 
     var context: c.CUcontext = undefined;
     try check(c.cuCtxCreate(&context, 0, device));
+    current_context = context;
 }
+
+/// Destroys the context created by `init`.
+pub fn deinit() void {
+    if (current_context) |context| {
+        check(c.cuCtxDestroy(context)) catch |err| {
+            std.log.warn("Failed to destroy CUDA context: {}", .{err});
+        };
+        current_context = null;
+    }
+}
+
+/// Blocks the host until all work in the current CUDA context has completed.
+pub fn synchronize() !void {
+    try check(c.cuCtxSynchronize());
+}
+
+/// Retrieves the currently initialized device. (Assuming ordinal 0 for this demo)
+pub fn getDevice() !c.CUdevice {
+    var device: c.CUdevice = undefined;
+    try check(c.cuDeviceGet(&device, 0));
+    return device;
+}
+
+/// Retrieves an attribute of the given device.
+pub fn deviceGetAttribute(attr: c.CUdevice_attribute, dev: c.CUdevice) !i32 {
+    var val: c_int = 0;
+    try check(c.cuDeviceGetAttribute(&val, attr, dev));
+    return val;
+}
+
+/// Calculates theoretical occupancy and block dimensions based on device limits.
+pub const OccupancyCalculator = struct {
+    max_threads_per_block: i32,
+    max_shared_memory_per_block: i32,
+    max_threads_per_sm: i32,
+    sm_count: i32,
+    warp_size: i32,
+
+    pub fn init(dev: c.CUdevice) !OccupancyCalculator {
+        return .{
+            .max_threads_per_block = try deviceGetAttribute(c.CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, dev),
+            .max_shared_memory_per_block = try deviceGetAttribute(c.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, dev),
+            .max_threads_per_sm = try deviceGetAttribute(c.CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, dev),
+            .sm_count = try deviceGetAttribute(c.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev),
+            .warp_size = try deviceGetAttribute(c.CU_DEVICE_ATTRIBUTE_WARP_SIZE, dev),
+        };
+    }
+
+    pub fn printInfo(self: OccupancyCalculator) void {
+        std.log.info("--- Device Properties ---", .{});
+        std.log.info("  SM Count: {}", .{self.sm_count});
+        std.log.info("  Max Threads/SM: {}", .{self.max_threads_per_sm});
+        std.log.info("  Max Threads/Block: {}", .{self.max_threads_per_block});
+        std.log.info("  Max Shared Mem/Block: {} KB", .{@divTrunc(self.max_shared_memory_per_block, 1024)});
+        std.log.info("  Warp Size: {}", .{self.warp_size});
+    }
+};
 
 /// Allocates `n` elements of type `T` on the device.
 pub fn malloc(comptime T: type, n: usize) ![]T {
+    const bytes = std.math.mul(usize, n, @sizeOf(T)) catch return error.Overflow;
     var result: usize = 0; // cuda driver does not write to the upper bytes, so initialize as zero!
-    try check(c.cuMemAlloc(@ptrCast(&result), n * @sizeOf(T)));
+    try check(c.cuMemAlloc(@ptrCast(&result), bytes));
     return @as([*]T, @ptrFromInt(result))[0..n];
 }
 
@@ -186,10 +267,11 @@ pub const CopyDir = enum {
 
 /// Copies memory between host and device.
 pub fn memcpy(comptime T: type, dst: []T, src: []const T, direction: CopyDir) !void {
-    assert(dst.len >= src.len);
+    if (dst.len < src.len) return error.InvalidValue;
+    const bytes = std.math.mul(usize, src.len, @sizeOf(T)) catch return error.Overflow;
     switch (direction) {
-        .host_to_device => try check(c.cuMemcpyHtoD(dst.ptr, src.ptr, @sizeOf(T) * src.len)),
-        .device_to_host => try check(c.cuMemcpyDtoH(dst.ptr, src.ptr, @sizeOf(T) * src.len)),
+        .host_to_device => try check(c.cuMemcpyHtoD(dst.ptr, src.ptr, bytes)),
+        .device_to_host => try check(c.cuMemcpyDtoH(dst.ptr, src.ptr, bytes)),
     }
 }
 
