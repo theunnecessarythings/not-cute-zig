@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
 
     // Build final executable
     const exe = b.addExecutable(.{
-        .name = "vector-add-minimal",
+        .name = "not-cute-zig",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = host_target,
@@ -24,6 +24,26 @@ pub fn build(b: *std.Build) void {
 
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
+
+    const layout_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/layout.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+
+    const mma_tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/mma.zig"),
+            .target = host_target,
+            .optimize = optimize,
+        }),
+    });
+
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&b.addRunArtifact(layout_tests).step);
+    test_step.dependOn(&b.addRunArtifact(mma_tests).step);
 
     const nvptx_mcpu = b.option([]const u8, "gpu", "Target GPU features to add or subtract") orelse "sm_80";
     const nvptx_target = b.resolveTargetQuery(std.Build.parseTargetQuery(.{
