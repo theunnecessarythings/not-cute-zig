@@ -23,7 +23,7 @@ app = modal.App(APP_NAME, image=image)
 
 
 @app.function(gpu="A10G", timeout=900)
-def run_demos() -> None:
+def run_demos(args: list[str]) -> None:
     subprocess.run(
         ["nvidia-smi"],
         check=True,
@@ -32,12 +32,20 @@ def run_demos() -> None:
         ["chmod", "+x", REMOTE_BINARY],
         check=True,
     )
+    
+    cmd = [REMOTE_BINARY] + args
     subprocess.run(
-        [REMOTE_BINARY],
+        cmd,
         check=True,
     )
 
 
 @app.local_entrypoint()
-def main() -> None:
-    run_demos.remote()
+def main(demo: str = "all") -> None:
+    """
+    Run the not-cute-zig demos on an A10G GPU.
+    
+    Args:
+        demo: The specific demo to run. Options: "vector-add", "transpose", "ownership", "mma", "streams", "reduction", "batched-mma", "benchmark", "all"
+    """
+    run_demos.remote([demo])

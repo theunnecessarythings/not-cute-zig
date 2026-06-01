@@ -2,21 +2,173 @@ const std = @import("std");
 const cuda = @import("cuda.zig");
 const layout = @import("layout.zig");
 const config = @import("config.zig");
+const benchmark = @import("benchmark.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
 };
 
 pub fn main() !void {
-    cuda.init();
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+
+    var args = try std.process.argsWithAllocator(alloc);
+    defer args.deinit();
+
+    _ = args.skip(); // skip exe name
+    const cmd = args.next() orelse {
+        std.log.err("Usage: not-cute-zig <demo_name>", .{});
+        std.log.err("Available demos: vector-add, transpose, ownership, mma, streams, reduction, batched-mma, benchmark, all", .{});
+        return error.MissingCommand;
+    };
+
+    try cuda.init();
 
     const module = try cuda.Module.loadData(@embedFile("cuda-module"));
     defer module.unload();
 
-    try runVectorAdd(module);
-    try runMatrixTranspose(module);
-    try runOwnershipDebug(module);
-    try runMmaMatmul(module);
+    if (std.mem.eql(u8, cmd, "vector-add")) {
+        try runVectorAdd(module);
+    } else if (std.mem.eql(u8, cmd, "transpose")) {
+        try runMatrixTranspose(module);
+    } else if (std.mem.eql(u8, cmd, "ownership")) {
+        try runOwnershipDebug(module);
+    } else if (std.mem.eql(u8, cmd, "mma")) {
+        try runMmaMatmul(module);
+    } else if (std.mem.eql(u8, cmd, "streams")) {
+        try runStreamsDemo(module);
+    } else if (std.mem.eql(u8, cmd, "reduction")) {
+        try runReductionDemo(module);
+    } else if (std.mem.eql(u8, cmd, "batched-mma")) {
+        try runBatchedMma(module);
+    } else if (std.mem.eql(u8, cmd, "benchmark")) {
+        try runBenchmarkDemo(module);
+    } else if (std.mem.eql(u8, cmd, "all")) {
+        try runVectorAdd(module);
+        try runMatrixTranspose(module);
+        try runOwnershipDebug(module);
+        try runMmaMatmul(module);
+        try runStreamsDemo(module);
+        try runReductionDemo(module);
+        try runBatchedMma(module);
+        try runBenchmarkDemo(module);
+    } else {
+        std.log.err("Unknown demo: {s}", .{cmd});
+        return error.UnknownCommand;
+    }
+}
+
+fn runBatchedMma(module: cuda.Module) !void {
+    const num_batches = 4;
+    const a_len = config.mma_m * config.mma_k;
+    const b_len = config.mma_k * config.mma_n;
+    const c_len = config.mma_m * config.mma_n;
+
+    const d_a = try cuda.malloc(f16, a_len * num_batches);
+    defer cuda.free(d_a);
+
+    const d_b = try cuda.malloc(f16, b_len * num_batches);
+    defer cuda.free(d_b);
+
+    const d_c = try cuda.malloc(f32, c_len * num_batches);
+    defer cuda.free(d_c);
+
+    const d_d = try cuda.malloc(f32, c_len * num_batches);
+    defer cuda.free(d_d);
+
+    const kernel = try module.getFunction("batched_mma_matmul");
+    try kernel.launch(
+        .{
+            .grid_dim = .{ .x = 1, .y = num_batches },
+            .block_dim = .{ .x = 32 },
+        },
+        .{ d_a.ptr, d_b.ptr, d_c.ptr, d_d.ptr, @as(f32, 1.0), @as(f32, 0.0), a_len, b_len, c_len },
+    );
+
+    std.log.info("batched mma OK: {} batches of {}x{}x{}", .{ num_batches, config.mma_m, config.mma_n, config.mma_k });
+}
+
+fn runStreamsDemo(module: cuda.Module) !void {
+    const num_streams = 4;
+    var streams: [num_streams]cuda.Stream = undefined;
+    var d_outs: [num_streams][]u32 = undefined;
+
+    for (0..num_streams) |i| {
+        streams[i] = try cuda.Stream.create();
+        d_outs[i] = try cuda.malloc(u32, 1);
+    }
+
+    const kernel = try module.getFunction("stream_sleep");
+
+    std.log.info("Launching {} streams...", .{num_streams});
+    for (0..num_streams) |i| {
+        try kernel.launch(.{
+            .grid_dim = .{ .x = 1 },
+            .block_dim = .{ .x = 32 },
+            .stream = streams[i].handle,
+        }, .{
+            @as(u32, 500_000_000), // sleep ~0.5s per stream
+            d_outs[i].ptr,
+        });
+    }
+
+    for (0..num_streams) |i| {
+        try streams[i].synchronize();
+        streams[i].destroy();
+        var out: [1]u32 = .{0};
+        try cuda.memcpy(u32, &out, d_outs[i], .device_to_host);
+        cuda.free(d_outs[i]);
+        if (out[0] != 1) return error.StreamDemoFailed;
+    }
+
+    std.log.info("streams demo OK: concurrent sleep execution", .{});
+}
+
+fn runReductionDemo(module: cuda.Module) !void {
+    const len = 1000;
+    var input: [len]f32 = undefined;
+    var expected_sum: f32 = 0;
+
+    for (0..len) |i| {
+        input[i] = @floatFromInt(i % 10);
+        expected_sum += input[i];
+    }
+
+    const d_in = try cuda.malloc(f32, len);
+    defer cuda.free(d_in);
+
+    const block_size = 256;
+    const num_blocks = (len + block_size - 1) / block_size;
+    const d_out = try cuda.malloc(f32, num_blocks);
+    defer cuda.free(d_out);
+
+    try cuda.memcpy(f32, d_in, &input, .host_to_device);
+
+    const kernel = try module.getFunction("block_reduce_sum");
+    try kernel.launch(
+        .{
+            .grid_dim = .{ .x = num_blocks },
+            .block_dim = .{ .x = block_size },
+        },
+        .{ d_in.ptr, d_out.ptr, len },
+    );
+
+    const block_sums = try std.heap.page_allocator.alloc(f32, num_blocks);
+    defer std.heap.page_allocator.free(block_sums);
+    try cuda.memcpy(f32, block_sums, d_out, .device_to_host);
+
+    var actual_sum: f32 = 0;
+    for (0..num_blocks) |i| {
+        actual_sum += block_sums[i];
+    }
+
+    if (@abs(expected_sum - actual_sum) > 0.1) {
+        std.log.err("reduction mismatch: expected {}, got {}", .{ expected_sum, actual_sum });
+        return error.ReductionMismatch;
+    }
+
+    std.log.info("reduction demo OK: block reduce sum of {} elements", .{len});
 }
 
 fn runVectorAdd(module: cuda.Module) !void {
@@ -38,11 +190,11 @@ fn runVectorAdd(module: cuda.Module) !void {
     const d_out = try cuda.malloc(f32, config.vector_len);
     defer cuda.free(d_out);
 
-    cuda.memcpy(f32, d_a, &a, .host_to_device);
-    cuda.memcpy(f32, d_b, &b, .host_to_device);
+    try cuda.memcpy(f32, d_a, &a, .host_to_device);
+    try cuda.memcpy(f32, d_b, &b, .host_to_device);
 
     const kernel = try module.getFunction("vector_add");
-    kernel.launch(
+    try kernel.launch(
         .{
             .grid_dim = .{ .x = (config.vector_len + config.vector_block_size - 1) / config.vector_block_size },
             .block_dim = .{ .x = config.vector_block_size },
@@ -50,7 +202,7 @@ fn runVectorAdd(module: cuda.Module) !void {
         .{ d_a.ptr, d_b.ptr, d_out.ptr, config.vector_len },
     );
 
-    cuda.memcpy(f32, &out, d_out, .device_to_host);
+    try cuda.memcpy(f32, &out, d_out, .device_to_host);
 
     for (out, 0..) |actual, i| {
         const expected = a[i] + b[i];
@@ -82,10 +234,10 @@ fn runMatrixTranspose(module: cuda.Module) !void {
     const d_output = try cuda.malloc(f32, len);
     defer cuda.free(d_output);
 
-    cuda.memcpy(f32, d_input, &input, .host_to_device);
+    try cuda.memcpy(f32, d_input, &input, .host_to_device);
 
     const kernel = try module.getFunction("matrix_transpose");
-    kernel.launch(
+    try kernel.launch(
         .{
             .grid_dim = .{
                 .x = (config.transpose_cols + config.transpose_tile - 1) / config.transpose_tile,
@@ -96,7 +248,7 @@ fn runMatrixTranspose(module: cuda.Module) !void {
         .{ d_input.ptr, d_output.ptr, config.transpose_rows, config.transpose_cols },
     );
 
-    cuda.memcpy(f32, &output, d_output, .device_to_host);
+    try cuda.memcpy(f32, &output, d_output, .device_to_host);
 
     for (0..config.transpose_rows) |row| {
         for (0..config.transpose_cols) |col| {
@@ -131,7 +283,7 @@ fn runOwnershipDebug(module: cuda.Module) !void {
     defer cuda.free(d_output);
 
     const kernel = try module.getFunction("ownership_debug");
-    kernel.launch(
+    try kernel.launch(
         .{
             .grid_dim = .{ .x = @intCast(warp.ownerExtent()[0]) },
             .block_dim = .{ .x = config.ownership_warp_threads },
@@ -139,7 +291,7 @@ fn runOwnershipDebug(module: cuda.Module) !void {
         .{d_output.ptr},
     );
 
-    cuda.memcpy(u32, &output, d_output, .device_to_host);
+    try cuda.memcpy(u32, &output, d_output, .device_to_host);
 
     for (0..warp.ownerExtent()[0]) |warp_id| {
         for (0..config.ownership_warp_threads) |lane_id| {
@@ -180,6 +332,56 @@ fn runOwnershipDebug(module: cuda.Module) !void {
 
 fn encodeOwnership(warp_id: u32, lane_owner: u32, value_id: u32) u32 {
     return (warp_id << 24) | (lane_owner << 8) | value_id;
+}
+
+fn runBenchmarkDemo(module: cuda.Module) !void {
+    const len = 10_000_000;
+    const bytes = len * @sizeOf(f32) * 3; // 2 reads, 1 write
+
+    var a: [1]f32 = .{1.0};
+    const d_a = try cuda.malloc(f32, len);
+    defer cuda.free(d_a);
+
+    const d_b = try cuda.malloc(f32, len);
+    defer cuda.free(d_b);
+
+    const d_out = try cuda.malloc(f32, len);
+    defer cuda.free(d_out);
+
+    // Initialization (just copy a 1 to first element to avoid empty allocations)
+    try cuda.memcpy(f32, d_a[0..1], &a, .host_to_device);
+    try cuda.memcpy(f32, d_b[0..1], &a, .host_to_device);
+
+    const kernel = try module.getFunction("vector_add");
+    const args = .{ d_a.ptr, d_b.ptr, d_out.ptr, len };
+
+    std.log.info("Starting runtime parameter sweep for vector_add (len={})...", .{len});
+
+    // Sweep block sizes
+    const configs = [_]cuda.LaunchConfig{
+        .{ .grid_dim = .{ .x = @intCast((len + 31) / 32) }, .block_dim = .{ .x = 32 } },
+        .{ .grid_dim = .{ .x = @intCast((len + 63) / 64) }, .block_dim = .{ .x = 64 } },
+        .{ .grid_dim = .{ .x = @intCast((len + 127) / 128) }, .block_dim = .{ .x = 128 } },
+        .{ .grid_dim = .{ .x = @intCast((len + 255) / 256) }, .block_dim = .{ .x = 256 } },
+        .{ .grid_dim = .{ .x = @intCast((len + 511) / 512) }, .block_dim = .{ .x = 512 } },
+    };
+
+    const best_cfg = try benchmark.tuneRuntime(.{
+        .warmup_iters = 2,
+        .iters = 5,
+    }, &configs, kernel, args);
+
+    std.log.info("Best config found: block_dim.x={}", .{best_cfg.block_dim.x});
+
+    std.log.info("Running full benchmark on best config...", .{});
+    const res = try benchmark.runKernel(.{
+        .warmup_iters = 5,
+        .iters = 20,
+        .bytes_processed = bytes,
+        .flops_processed = len, // 1 add per element
+    }, kernel, best_cfg, args);
+
+    res.print("vector_add (Best Config)");
 }
 
 fn runMmaMatmul(module: cuda.Module) !void {
@@ -230,12 +432,12 @@ fn runMmaMatmul(module: cuda.Module) !void {
     const d_d = try cuda.malloc(f32, c_len);
     defer cuda.free(d_d);
 
-    cuda.memcpy(f16, d_a, &a, .host_to_device);
-    cuda.memcpy(f16, d_b, &b, .host_to_device);
-    cuda.memcpy(f32, d_c, &c, .host_to_device);
+    try cuda.memcpy(f16, d_a, &a, .host_to_device);
+    try cuda.memcpy(f16, d_b, &b, .host_to_device);
+    try cuda.memcpy(f32, d_c, &c, .host_to_device);
 
     const kernel = try module.getFunction("mma_matmul");
-    kernel.launch(
+    try kernel.launch(
         .{
             .grid_dim = .{ .x = 1 },
             .block_dim = .{ .x = 32 },
@@ -243,7 +445,7 @@ fn runMmaMatmul(module: cuda.Module) !void {
         .{ d_a.ptr, d_b.ptr, d_c.ptr, d_d.ptr, alpha, beta },
     );
 
-    cuda.memcpy(f32, &d, d_d, .device_to_host);
+    try cuda.memcpy(f32, &d, d_d, .device_to_host);
 
     for (0..config.mma_m) |row| {
         for (0..config.mma_n) |col| {

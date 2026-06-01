@@ -329,6 +329,21 @@ pub const XorSwizzle = struct {
     target_bit: u6,
     width: u6,
 
+    /// 128-byte swizzle (e.g., float4 or 16-byte aligned accesses)
+    pub fn swizzle128b() XorSwizzle {
+        return .{ .source_bit = 4, .target_bit = 1, .width = 3 }; // shifts based on 16B alignment
+    }
+
+    /// 64-byte swizzle (e.g., float2 or 8-byte aligned accesses)
+    pub fn swizzle64b() XorSwizzle {
+        return .{ .source_bit = 3, .target_bit = 1, .width = 3 };
+    }
+
+    /// 32-byte swizzle (e.g., float or 4-byte aligned accesses)
+    pub fn swizzle32b() XorSwizzle {
+        return .{ .source_bit = 2, .target_bit = 1, .width = 3 };
+    }
+
     pub fn apply(self: XorSwizzle, offset_value: usize) usize {
         var result = offset_value;
         var bit: u6 = 0;

@@ -1,12 +1,68 @@
 const layout = @import("layout.zig");
 const mma = @import("mma.zig");
 const config = @import("config.zig");
+const device = @import("device.zig");
 
 const use_swizzled_shared_transpose = false;
 
 var transpose_shared: [config.transpose_tile * config.transpose_tile]f32 addrspace(.shared) = undefined;
 var mma_shared_a: [config.mma_m * config.mma_k]f16 addrspace(.shared) = undefined;
 var mma_shared_b: [config.mma_k * config.mma_n]f16 addrspace(.shared) = undefined;
+var reduce_shared: [32]f32 addrspace(.shared) = undefined;
+
+pub fn stream_sleep(
+    clock_count: u32,
+    out: [*]addrspace(.global) u32,
+) callconv(.kernel) void {
+    const tid = @workItemId(0);
+    if (tid == 0) {
+        device.nanosleep(clock_count);
+        out[0] = 1;
+    }
+}
+
+pub fn block_reduce_sum(
+    input: [*]addrspace(.global) const f32,
+    output: [*]addrspace(.global) f32,
+    len: usize,
+) callconv(.kernel) void {
+    const tid = @workItemId(0);
+    const bid = @workGroupId(0);
+    const bdim = @workGroupSize(0);
+    const idx = bid * bdim + tid;
+
+    var sum: f32 = 0;
+    if (idx < len) {
+        sum = input[idx];
+    }
+
+    // Warp reduction (xor shuffle is fine for all-reduce, down is fine for standard reduce)
+    // Actually, butterfly is fine for all-reduce. The problem is we use offset as a mask!
+    // shfl.sync.bfly uses `lane_id ^ mask`.
+    inline for (.{ 16, 8, 4, 2, 1 }) |offset| {
+        const val_u32 = device.shfl_sync_bfly(0xFFFFFFFF, @bitCast(sum), offset, 32);
+        sum += @as(f32, @bitCast(val_u32));
+    }
+
+    const lane = tid % 32;
+    const warp_id = tid / 32;
+
+    if (lane == 0) {
+        reduce_shared[warp_id] = sum;
+    }
+    device.syncthreads();
+
+    if (warp_id == 0) {
+        sum = if (lane < (bdim / 32)) reduce_shared[lane] else 0;
+        inline for (.{ 16, 8, 4, 2, 1 }) |offset| {
+            const val_u32 = device.shfl_sync_bfly(0xFFFFFFFF, @bitCast(sum), offset, 32);
+            sum += @as(f32, @bitCast(val_u32));
+        }
+        if (lane == 0) {
+            output[bid] = sum;
+        }
+    }
+}
 
 pub fn vector_add(
     a: [*]addrspace(.global) const f32,
@@ -109,6 +165,37 @@ pub fn mma_matmul(
     alpha: f32,
     beta: f32,
 ) callconv(.kernel) void {
+    mma_matmul_impl(a, b, c, d, alpha, beta);
+}
+
+pub fn batched_mma_matmul(
+    a: [*]addrspace(.global) const f16,
+    b: [*]addrspace(.global) const f16,
+    c: [*]addrspace(.global) const f32,
+    d: [*]addrspace(.global) f32,
+    alpha: f32,
+    beta: f32,
+    batch_stride_a: usize,
+    batch_stride_b: usize,
+    batch_stride_c: usize,
+) callconv(.kernel) void {
+    const batch_id = @workGroupId(1);
+    const batched_a = a + batch_id * batch_stride_a;
+    const batched_b = b + batch_id * batch_stride_b;
+    const batched_c = c + batch_id * batch_stride_c;
+    const batched_d = d + batch_id * batch_stride_c;
+
+    mma_matmul_impl(batched_a, batched_b, batched_c, batched_d, alpha, beta);
+}
+
+inline fn mma_matmul_impl(
+    a: [*]addrspace(.global) const f16,
+    b: [*]addrspace(.global) const f16,
+    c: [*]addrspace(.global) const f32,
+    d: [*]addrspace(.global) f32,
+    alpha: f32,
+    beta: f32,
+) void {
     const Backend = mma.Backend(mma.m16n8k16_f16_f32);
 
     const a_layout = layout.rowMajor(.{ config.mma_m, config.mma_k });

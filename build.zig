@@ -45,6 +45,14 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&b.addRunArtifact(layout_tests).step);
     test_step.dependOn(&b.addRunArtifact(mma_tests).step);
 
+    const docs_step = b.step("docs", "Generate HTML documentation");
+    const docs_install = b.addInstallDirectory(.{
+        .source_dir = exe.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    docs_step.dependOn(&docs_install.step);
+
     const nvptx_mcpu = b.option([]const u8, "gpu", "Target GPU features to add or subtract") orelse "sm_80";
     const nvptx_target = b.resolveTargetQuery(std.Build.parseTargetQuery(.{
         .arch_os_abi = "nvptx64-cuda-none",
