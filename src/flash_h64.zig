@@ -5,6 +5,7 @@ const mma = @import("mma.zig");
 
 const head_dim_static = 64;
 const output_chunks = head_dim_static / config.flash_mma_n;
+const owned_output_chunks = output_chunks / config.flash_warps;
 
 var flash_h64_shared_q: [config.flash_warps * config.flash_block_m * config.mma_k]f16 addrspace(.shared) = undefined;
 var flash_h64_shared_k: [config.flash_warps * config.mma_k * config.flash_mma_n]f16 addrspace(.shared) = undefined;
@@ -57,9 +58,9 @@ pub fn flash_attention_fwd_h64(
     const shared_v_ptr = shared_v_all_ptr + warp_id * config.mma_k * config.flash_mma_n;
     const shared_p_mma_ptr = shared_p_mma_all_ptr + warp_id * config.flash_block_m * config.mma_k;
 
-    var o_acc: [output_chunks]Backend.Accumulator = undefined;
-    inline for (0..output_chunks) |chunk| {
-        o_acc[chunk] = Backend.zeroAccumulator();
+    var o_acc: [owned_output_chunks]Backend.Accumulator = undefined;
+    inline for (0..owned_output_chunks) |local_chunk| {
+        o_acc[local_chunk] = Backend.zeroAccumulator();
     }
 
     if (thread_id < config.flash_block_m) {
@@ -194,48 +195,43 @@ pub fn flash_attention_fwd_h64(
         inline for (0..4) |acc_i| {
             const row = Backend.accumulatorCoord(lane_id, acc_i)[0];
             const old_scale = flash_h64_old_scale_shared[row];
-            inline for (0..output_chunks) |chunk| {
-                if (chunk % config.flash_warps == warp_id) {
-                    o_acc[chunk][acc_i] *= old_scale;
-                }
+            inline for (0..owned_output_chunks) |local_chunk| {
+                o_acc[local_chunk][acc_i] *= old_scale;
             }
         }
 
-        inline for (0..output_chunks) |chunk| {
-            const owns_chunk = chunk % config.flash_warps == warp_id;
-            if (owns_chunk) {
-                var load_i = lane_id;
-                while (load_i < config.mma_k * config.flash_mma_n) : (load_i += Backend.lanes) {
-                    const kk = load_i / config.flash_mma_n;
-                    const col = load_i % config.flash_mma_n;
-                    const key_row = tile_start + kk;
-                    const out_col = chunk * config.flash_mma_n + col;
-                    shared_v_ptr[load_i] = if (key_row < seq_len)
-                        v_batch[key_row * head_dim_static + out_col]
-                    else
-                        0;
-                }
+        inline for (0..owned_output_chunks) |local_chunk| {
+            const chunk: usize = local_chunk * config.flash_warps + @as(usize, @intCast(warp_id));
 
-                var p_load_i = lane_id;
-                while (p_load_i < config.flash_block_m * config.mma_k) : (p_load_i += Backend.lanes) {
-                    const row = p_load_i / config.mma_k;
-                    const col = p_load_i % config.mma_k;
-                    shared_p_mma_ptr[row * config.mma_k + col] = shared_p_ptr[row * config.mma_k + col];
-                }
+            var load_i = lane_id;
+            while (load_i < config.mma_k * config.flash_mma_n) : (load_i += Backend.lanes) {
+                const kk = load_i / config.flash_mma_n;
+                const col = load_i % config.flash_mma_n;
+                const key_row = tile_start + kk;
+                const out_col = chunk * config.flash_mma_n + col;
+                shared_v_ptr[load_i] = if (key_row < seq_len)
+                    v_batch[key_row * head_dim_static + out_col]
+                else
+                    0;
             }
 
-            blockBarrier();
-
-            if (owns_chunk) {
-                const p_frag = Backend.loadA(shared_p_mma_ptr, config.mma_k, lane_id);
-                const v_frag = Backend.loadB(shared_v_ptr, config.flash_mma_n, lane_id);
-                const pv = Backend.mma(p_frag, v_frag, Backend.zeroAccumulator());
-                inline for (0..4) |acc_i| {
-                    o_acc[chunk][acc_i] += pv[acc_i];
-                }
+            var p_load_i = lane_id;
+            while (p_load_i < config.flash_block_m * config.mma_k) : (p_load_i += Backend.lanes) {
+                const row = p_load_i / config.mma_k;
+                const col = p_load_i % config.mma_k;
+                shared_p_mma_ptr[row * config.mma_k + col] = shared_p_ptr[row * config.mma_k + col];
             }
 
-            blockBarrier();
+            warpBarrier();
+
+            const p_frag = Backend.loadA(shared_p_mma_ptr, config.mma_k, lane_id);
+            const v_frag = Backend.loadB(shared_v_ptr, config.flash_mma_n, lane_id);
+            const pv = Backend.mma(p_frag, v_frag, Backend.zeroAccumulator());
+            inline for (0..4) |acc_i| {
+                o_acc[local_chunk][acc_i] += pv[acc_i];
+            }
+
+            warpBarrier();
         }
     }
 
@@ -247,11 +243,10 @@ pub fn flash_attention_fwd_h64(
         const denom = flash_h64_row_sum_shared[row];
 
         if (q_row < seq_len) {
-            inline for (0..output_chunks) |chunk| {
-                if (chunk % config.flash_warps == warp_id) {
-                    const out_col = col + config.flash_mma_n * chunk;
-                    o_batch[q_row * head_dim_static + out_col] = o_acc[chunk][acc_i] / denom;
-                }
+            inline for (0..owned_output_chunks) |local_chunk| {
+                const chunk: usize = local_chunk * config.flash_warps + @as(usize, @intCast(warp_id));
+                const out_col = col + config.flash_mma_n * chunk;
+                o_batch[q_row * head_dim_static + out_col] = o_acc[local_chunk][acc_i] / denom;
             }
         }
     }
@@ -259,4 +254,8 @@ pub fn flash_attention_fwd_h64(
 
 fn blockBarrier() void {
     asm volatile ("bar.sync 0;");
+}
+
+fn warpBarrier() void {
+    asm volatile ("bar.warp.sync 0xffffffff;");
 }

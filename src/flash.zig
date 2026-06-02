@@ -86,6 +86,9 @@ pub fn selectKernel(opts: Options) KernelSelection {
     if (opts.head_dim == 64 and !opts.causal and opts.seq_len <= 256 and opts.batch_heads <= 8) {
         return .{ .name = "flash_attention_fwd_v2", .label = "flash_attention_fwd_v2", .threads = 4 * 32 };
     }
+    if (opts.head_dim == 64 and opts.seq_len >= 512) {
+        return .{ .name = "flash_attention_fwd_h64_bn32", .label = "flash_attention_fwd_h64_bn32", .threads = 4 * 32 };
+    }
     if (opts.head_dim == 64) {
         return .{ .name = "flash_attention_fwd_h64", .label = "flash_attention_fwd_h64", .threads = config.flash_warps * 32 };
     }

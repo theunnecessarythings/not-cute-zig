@@ -7,6 +7,7 @@ const flash_opt = @import("flash_opt.zig");
 const flash_v2 = @import("flash_v2.zig");
 const flash_h64 = @import("flash_h64.zig");
 const flash_h64_causal = @import("flash_h64_causal.zig");
+const flash_h64_bn32 = @import("flash_h64_bn32.zig");
 
 // Custom panic handler, to prevent stack traces etc on this target.
 pub fn panic(msg: []const u8, stack_trace: ?*std.builtin.StackTrace, _: ?usize) noreturn {
@@ -42,4 +43,5 @@ comptime {
     exportKernels(flash_v2);
     exportKernels(flash_h64);
     exportKernels(flash_h64_causal);
+    exportKernels(flash_h64_bn32);
 }
