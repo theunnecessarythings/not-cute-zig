@@ -42,14 +42,15 @@ pub fn launch(
     try requireLen(f16, v, opts.batch_heads * opts.v_stride);
     try requireLen(f32, o, opts.batch_heads * opts.o_stride);
 
-    const kernel = try module.getFunction("flash_attention_fwd");
+    const selected = selectKernel(opts);
+    const kernel = try module.getFunction(selected.name);
     try kernel.launch(
         .{
             .grid_dim = .{
                 .x = @intCast((opts.seq_len + config.flash_block_m - 1) / config.flash_block_m),
                 .y = @intCast(opts.batch_heads),
             },
-            .block_dim = .{ .x = config.flash_warps * 32 },
+            .block_dim = .{ .x = selected.threads },
         },
         .{
             q.ptr,
@@ -66,6 +67,29 @@ pub fn launch(
             @as(u32, if (opts.causal) 1 else 0),
         },
     );
+}
+
+pub const KernelSelection = struct {
+    name: [*:0]const u8,
+    label: []const u8,
+    threads: u32,
+};
+
+pub fn selectKernel(opts: Options) KernelSelection {
+    // v2's wider 16x32 tile improves small/medium head16/head32 shapes, but
+    // currently regresses head64 and long/high-parallelism cases because PV is
+    // still warp-0 owned. Keep dispatch benchmark-driven until the next kernel
+    // generation has a parallel PV schedule.
+    if (opts.head_dim <= 32 and opts.seq_len <= 256 and opts.batch_heads <= 8) {
+        return .{ .name = "flash_attention_fwd_v2", .label = "flash_attention_fwd_v2", .threads = 4 * 32 };
+    }
+    if (opts.head_dim == 64 and !opts.causal and opts.seq_len <= 256 and opts.batch_heads <= 8) {
+        return .{ .name = "flash_attention_fwd_v2", .label = "flash_attention_fwd_v2", .threads = 4 * 32 };
+    }
+    if (opts.head_dim == 64) {
+        return .{ .name = "flash_attention_fwd_h64", .label = "flash_attention_fwd_h64", .threads = config.flash_warps * 32 };
+    }
+    return .{ .name = "flash_attention_fwd_opt", .label = "flash_attention_fwd_opt", .threads = config.flash_warps * 32 };
 }
 
 fn requireLen(comptime T: type, slice: []const T, min_len: usize) !void {

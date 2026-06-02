@@ -70,8 +70,18 @@ The current flash-attention kernel computes single-head self-attention for row-m
 `Q/K/V/O` tensors with explicit element strides per flattened batch/head slice.
 It uses query CTAs, shared-memory K/V tiles, tensor cores for QK and PV,
 lane-parallel row max/sum reductions, causal masking, and online softmax state
-across K/V tiles. The flash tile shape is currently `block_m=16`, `block_n=16`
-with two warps per CTA, using two `m16n8k16` MMA subtiles per K/V tile. The current implementation supports
+across K/V tiles. Host flash launches use benchmark-driven dispatch between
+`flash_attention_fwd_opt`, `flash_attention_fwd_v2`, the head64-specialized
+`flash_attention_fwd_h64`, and the experimental causal head64-specialized
+`flash_attention_fwd_h64_causal`. The v2 flash tile shape is `block_m=16`,
+`block_n=32` with four QK warps per CTA. Q is cached once per query CTA and
+reused across the K/V sweep; causal mode skips fully future-masked K/V tiles.
+Dispatch currently uses v2 for short head16/head32 workloads and short
+non-causal head64 workloads, while routing other head64 workloads to
+`flash_attention_fwd_h64`. The causal head64 specialization remains exported
+for measurement, but is not selected by default because it benchmarked slower
+than the generic head64 specialization on A10G.
+The current implementation supports
 `head_dim == 16`, `32`, or `64`; the smoke test validates padded causal/non-causal slices, and
 `benchmark` includes causal/non-causal flash timing runs for `seq_len` 32, 64,
 and 128.
@@ -105,7 +115,7 @@ zig build -Dgpu=sm_86
 modal run modal_run.py --demo profile-flash
 ```
 
-`profile-flash` runs `ncu` against only `flash_attention_fwd` for
+`profile-flash` runs `ncu` against the selected flash forward kernel for
 `batch_heads=8, seq_len=1024, head_dim=64, causal=true`, collecting speed-of-light,
 occupancy, scheduler, warp-state, and memory workload sections. Some hosted GPU
 runtimes restrict profiler injection; if `ncu` fails, the Modal wrapper prints

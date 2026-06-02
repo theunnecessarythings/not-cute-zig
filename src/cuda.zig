@@ -88,6 +88,7 @@ pub const c = struct {
     pub const CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT = 16;
     pub const CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_BLOCK = 12;
     pub const CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR = 39;
+    pub const CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR = 82;
     pub extern fn cuCtxSynchronize() CUresult;
     pub extern fn cuStreamCreate(stream: *CUstream, flags: c_uint) CUresult;
     pub extern fn cuStreamDestroy(stream: CUstream) CUresult;
@@ -104,6 +105,16 @@ pub const c = struct {
     pub extern fn cuModuleLoadData(module: *CUmodule, image: *const anyopaque) CUresult;
     pub extern fn cuModuleUnload(module: CUmodule) CUresult;
     pub extern fn cuModuleGetFunction(function: *CUfunction, module: CUmodule, name: [*:0]const u8) CUresult;
+    pub const CUfunction_attribute = c_uint;
+    pub const CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK = 0;
+    pub const CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES = 1;
+    pub const CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES = 2;
+    pub const CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES = 3;
+    pub const CU_FUNC_ATTRIBUTE_NUM_REGS = 4;
+    pub const CU_FUNC_ATTRIBUTE_PTX_VERSION = 5;
+    pub const CU_FUNC_ATTRIBUTE_BINARY_VERSION = 6;
+    pub const CU_FUNC_ATTRIBUTE_CACHE_MODE_CA = 7;
+    pub extern fn cuFuncGetAttribute(pi: *c_int, attrib: CUfunction_attribute, hfunc: CUfunction) CUresult;
     pub extern fn cuLaunchKernel(
         function: CUfunction,
         gdx: c_uint,
@@ -217,6 +228,7 @@ pub fn deviceGetAttribute(attr: c.CUdevice_attribute, dev: c.CUdevice) !i32 {
 pub const OccupancyCalculator = struct {
     max_threads_per_block: i32,
     max_shared_memory_per_block: i32,
+    max_registers_per_sm: i32,
     max_threads_per_sm: i32,
     sm_count: i32,
     warp_size: i32,
@@ -225,6 +237,7 @@ pub const OccupancyCalculator = struct {
         return .{
             .max_threads_per_block = try deviceGetAttribute(c.CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK, dev),
             .max_shared_memory_per_block = try deviceGetAttribute(c.CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK, dev),
+            .max_registers_per_sm = try deviceGetAttribute(c.CU_DEVICE_ATTRIBUTE_MAX_REGISTERS_PER_MULTIPROCESSOR, dev),
             .max_threads_per_sm = try deviceGetAttribute(c.CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_MULTIPROCESSOR, dev),
             .sm_count = try deviceGetAttribute(c.CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT, dev),
             .warp_size = try deviceGetAttribute(c.CU_DEVICE_ATTRIBUTE_WARP_SIZE, dev),
@@ -237,6 +250,7 @@ pub const OccupancyCalculator = struct {
         std.log.info("  Max Threads/SM: {}", .{self.max_threads_per_sm});
         std.log.info("  Max Threads/Block: {}", .{self.max_threads_per_block});
         std.log.info("  Max Shared Mem/Block: {} KB", .{@divTrunc(self.max_shared_memory_per_block, 1024)});
+        std.log.info("  Max Registers/SM: {}", .{self.max_registers_per_sm});
         std.log.info("  Warp Size: {}", .{self.warp_size});
     }
 };
@@ -344,6 +358,34 @@ pub const Dim3 = struct {
 /// Represents a CUDA kernel function.
 pub const Function = struct {
     handle: c.CUfunction,
+
+    pub const Attributes = struct {
+        max_threads_per_block: i32,
+        shared_size_bytes: i32,
+        const_size_bytes: i32,
+        local_size_bytes: i32,
+        num_regs: i32,
+        ptx_version: i32,
+        binary_version: i32,
+    };
+
+    pub fn getAttributes(self: Function) !Attributes {
+        return .{
+            .max_threads_per_block = try self.getAttribute(c.CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK),
+            .shared_size_bytes = try self.getAttribute(c.CU_FUNC_ATTRIBUTE_SHARED_SIZE_BYTES),
+            .const_size_bytes = try self.getAttribute(c.CU_FUNC_ATTRIBUTE_CONST_SIZE_BYTES),
+            .local_size_bytes = try self.getAttribute(c.CU_FUNC_ATTRIBUTE_LOCAL_SIZE_BYTES),
+            .num_regs = try self.getAttribute(c.CU_FUNC_ATTRIBUTE_NUM_REGS),
+            .ptx_version = try self.getAttribute(c.CU_FUNC_ATTRIBUTE_PTX_VERSION),
+            .binary_version = try self.getAttribute(c.CU_FUNC_ATTRIBUTE_BINARY_VERSION),
+        };
+    }
+
+    fn getAttribute(self: Function, attr: c.CUfunction_attribute) !i32 {
+        var value: c_int = 0;
+        try check(c.cuFuncGetAttribute(&value, attr, self.handle));
+        return value;
+    }
 
     /// Launches the kernel with the specified configuration and arguments.
     pub fn launch(self: Function, cfg: LaunchConfig, args: anytype) !void {

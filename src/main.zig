@@ -79,7 +79,53 @@ pub fn main() !void {
 }
 
 fn runProfileFlash(alloc: std.mem.Allocator, module: cuda.Module) !void {
+    const opts = flash.Options{
+        .batch_heads = 8,
+        .seq_len = 1024,
+        .head_dim = 64,
+        .q_stride = 1024 * 64,
+        .k_stride = 1024 * 64,
+        .v_stride = 1024 * 64,
+        .o_stride = 1024 * 64,
+        .scale = 1.0 / @sqrt(@as(f32, 64)),
+        .causal = true,
+    };
+    const selected = flash.selectKernel(opts);
+    const kernel = try module.getFunction(selected.name);
+    const attrs = try kernel.getAttributes();
+    const dev = try cuda.getDevice();
+    const occupancy = try cuda.OccupancyCalculator.init(dev);
+    const threads_per_block: i32 = @intCast(selected.threads);
+    const warps_per_block = @divTrunc(threads_per_block, occupancy.warp_size);
+    const active_blocks_by_threads = @divTrunc(occupancy.max_threads_per_sm, threads_per_block);
+    const regs_per_block = attrs.num_regs * threads_per_block;
+    const active_blocks_by_regs = if (regs_per_block > 0) @divTrunc(occupancy.max_registers_per_sm, regs_per_block) else active_blocks_by_threads;
+    const active_blocks_by_smem = if (attrs.shared_size_bytes > 0) @divTrunc(occupancy.max_shared_memory_per_block, attrs.shared_size_bytes) else active_blocks_by_threads;
+    const active_blocks = @min(active_blocks_by_threads, @min(active_blocks_by_regs, active_blocks_by_smem));
+    const active_warps = active_blocks * warps_per_block;
+    const max_warps = @divTrunc(occupancy.max_threads_per_sm, occupancy.warp_size);
+
     std.log.info("profile: not-cute flash batch_heads=8 seq=1024 head=64 causal=true", .{});
+    std.log.info("profile: selected kernel {s}, threads/block={}", .{ selected.label, selected.threads });
+    std.log.info("profile: function attrs regs/thread={}, static_smem={} B, local={} B, const={} B, max_threads/block={}, ptx={}, binary={}", .{
+        attrs.num_regs,
+        attrs.shared_size_bytes,
+        attrs.local_size_bytes,
+        attrs.const_size_bytes,
+        attrs.max_threads_per_block,
+        attrs.ptx_version,
+        attrs.binary_version,
+    });
+    std.log.info("profile: occupancy limits blocks/SM threads={}, regs={}, smem={}, selected={}", .{
+        active_blocks_by_threads,
+        active_blocks_by_regs,
+        active_blocks_by_smem,
+        active_blocks,
+    });
+    std.log.info("profile: selected occupancy warps/SM={} of max {}", .{
+        active_warps,
+        max_warps,
+    });
     try compareFlash(alloc, module, 8, 1024, 64, true);
 }
 
@@ -771,13 +817,14 @@ fn runFlashBenchmarkCase(
         .scale = scale,
         .causal = causal,
     };
-    const kernel = try module.getFunction("flash_attention_fwd");
+    const selected = flash.selectKernel(opts);
+    const kernel = try module.getFunction(selected.name);
     const cfg = cuda.LaunchConfig{
         .grid_dim = .{
             .x = @intCast((seq_len + config.flash_block_m - 1) / config.flash_block_m),
             .y = @intCast(batch_heads),
         },
-        .block_dim = .{ .x = config.flash_warps * 32 },
+        .block_dim = .{ .x = selected.threads },
     };
     const args = .{
         d_q.ptr,
@@ -805,7 +852,7 @@ fn runFlashBenchmarkCase(
     }, kernel, cfg, args);
 
     var name_buf: [96]u8 = undefined;
-    const name = try std.fmt.bufPrint(&name_buf, "flash_attention_fwd seq={} head={} causal={}", .{ seq_len, head_dim, causal });
+    const name = try std.fmt.bufPrint(&name_buf, "{s} seq={} head={} causal={}", .{ selected.label, seq_len, head_dim, causal });
     res.print(name);
 }
 
@@ -972,13 +1019,14 @@ fn compareFlash(alloc: std.mem.Allocator, module: cuda.Module, comptime batch_he
         .scale = scale,
         .causal = causal,
     };
-    const kernel = try module.getFunction("flash_attention_fwd");
+    const selected = flash.selectKernel(opts);
+    const kernel = try module.getFunction(selected.name);
     const cfg = cuda.LaunchConfig{
         .grid_dim = .{
             .x = @intCast((seq_len + config.flash_block_m - 1) / config.flash_block_m),
             .y = @intCast(batch_heads),
         },
-        .block_dim = .{ .x = config.flash_warps * 32 },
+        .block_dim = .{ .x = selected.threads },
     };
     const args = .{ d_q.ptr, d_k.ptr, d_v.ptr, d_o.ptr, opts.seq_len, opts.head_dim, opts.q_stride, opts.k_stride, opts.v_stride, opts.o_stride, opts.scale, @as(u32, if (opts.causal) 1 else 0) };
     const effective_seq = if (causal) (seq_len * (seq_len + 1)) / 2 else seq_len * seq_len;

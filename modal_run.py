@@ -114,7 +114,7 @@ def run_demos(args: list[str]) -> None:
             "--kernel-name-base",
             "function",
             "--kernel-name",
-            "flash_attention_fwd",
+            "regex:flash_attention_fwd_(opt|v2|h64|h64_causal)",
             "--launch-skip",
             "5",
             "--launch-count",
