@@ -15,3 +15,7 @@ pub const ownership_values_per_lane_owner = 8;
 pub const mma_m = 16;
 pub const mma_n = 8;
 pub const mma_k = 16;
+
+pub const flash_block_m = 16;
+pub const flash_block_n = 8;
+pub const flash_max_head_dim = 32;

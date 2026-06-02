@@ -1,3 +1,4 @@
+const std = @import("std");
 const layout = @import("layout.zig");
 const mma = @import("mma.zig");
 const config = @import("config.zig");
@@ -11,6 +12,14 @@ var mma_shared_b: [config.mma_k * config.mma_n]f16 addrspace(.shared) = undefine
 var mma_shared_a_1: [config.mma_m * config.mma_k]f16 addrspace(.shared) = undefined;
 var mma_shared_b_1: [config.mma_k * config.mma_n]f16 addrspace(.shared) = undefined;
 var reduce_shared: [32]f32 addrspace(.shared) = undefined;
+var flash_shared_q: [config.flash_block_m * config.flash_max_head_dim]f16 addrspace(.shared) = undefined;
+var flash_shared_k: [config.flash_block_n * config.flash_max_head_dim]f16 addrspace(.shared) = undefined;
+var flash_shared_v: [config.flash_block_n * config.flash_max_head_dim]f16 addrspace(.shared) = undefined;
+var flash_shared_p: [config.flash_block_m * config.flash_max_head_dim]f16 addrspace(.shared) = undefined;
+var flash_scores_shared: [config.flash_block_m * config.flash_block_n]f32 addrspace(.shared) = undefined;
+var flash_row_max_shared: [config.flash_block_m]f32 addrspace(.shared) = undefined;
+var flash_row_sum_shared: [config.flash_block_m]f32 addrspace(.shared) = undefined;
+var flash_old_scale_shared: [config.flash_block_m]f32 addrspace(.shared) = undefined;
 
 pub const Epilogue = enum(u32) {
     none = 0,
@@ -373,99 +382,229 @@ pub fn flash_attention_fwd(
     o: [*]addrspace(.global) f32,
     seq_len: usize,
     head_dim: usize,
+    q_stride: usize,
+    k_stride: usize,
+    v_stride: usize,
+    o_stride: usize,
     scale: f32,
+    causal: u32,
 ) callconv(.kernel) void {
-    _ = seq_len;
-    _ = head_dim;
+    if (seq_len == 0 or (head_dim != 16 and head_dim != 32)) return;
+
     const Backend = mma.Backend(mma.m16n8k16_f16_f32);
     const lane_id = @workItemId(0);
+    if (lane_id >= Backend.lanes) return;
 
-    // Simplified 1-block, 1-warp forward pass (16x16 block) for demonstration.
-    // In a real FA kernel, we'd loop over tiles of K and V to incrementally compute the softmax.
+    const log2e = 1.4426950408889634;
+    const q_base = @workGroupId(0) * config.flash_block_m;
+    const batch_id = @workGroupId(1);
+    const q_batch = q + batch_id * q_stride;
+    const k_batch = k + batch_id * k_stride;
+    const v_batch = v + batch_id * v_stride;
+    const o_batch = o + batch_id * o_stride;
 
-    const shared_q_ptr: [*]addrspace(.shared) f16 = @ptrCast(&mma_shared_a);
-    const shared_k_ptr: [*]addrspace(.shared) f16 = @ptrCast(&mma_shared_b);
+    const shared_q_ptr: [*]addrspace(.shared) f16 = @ptrCast(&flash_shared_q);
+    const shared_k_ptr: [*]addrspace(.shared) f16 = @ptrCast(&flash_shared_k);
+    const shared_v_ptr: [*]addrspace(.shared) f16 = @ptrCast(&flash_shared_v);
+    const shared_p_ptr: [*]addrspace(.shared) f16 = @ptrCast(&flash_shared_p);
 
-    // Q is 16x16 (m=16, k=16). Load Q.
-    var i = lane_id;
-    while (i < 16 * 16) : (i += 32) {
-        shared_q_ptr[i] = q[i];
-        shared_k_ptr[i] = k[i];
+    var o_acc_0 = Backend.zeroAccumulator();
+    var o_acc_1 = Backend.zeroAccumulator();
+    var o_acc_2 = Backend.zeroAccumulator();
+    var o_acc_3 = Backend.zeroAccumulator();
+
+    if (lane_id < config.flash_block_m) {
+        flash_row_max_shared[lane_id] = -std.math.inf(f32);
+        flash_row_sum_shared[lane_id] = 0;
+        flash_old_scale_shared[lane_id] = 0;
     }
+
     blockBarrier();
 
-    // 1. Compute S = Q * K^T * scale
-    // mma.m16n8k16.row.col uses B as col-major, so passing K directly computes Q * K^T
-    const q_frag = Backend.loadA(shared_q_ptr, 16, lane_id);
-    const k_frag = Backend.loadB(shared_k_ptr, 16, lane_id); // using 16 as stride to treat as 16x16
+    var tile_start: usize = 0;
+    while (tile_start < seq_len) : (tile_start += config.flash_block_n) {
+        var scores = Backend.zeroAccumulator();
 
-    var s_acc = Backend.mma(q_frag, k_frag, Backend.zeroAccumulator());
+        var k_start: usize = 0;
+        while (k_start < head_dim) : (k_start += config.mma_k) {
+            var load_i = lane_id;
+            while (load_i < config.flash_block_m * config.mma_k) : (load_i += Backend.lanes) {
+                const row = load_i / config.mma_k;
+                const col = load_i % config.mma_k;
+                const q_row = q_base + row;
+                const q_col = k_start + col;
+                shared_q_ptr[row * config.mma_k + col] = if (q_row < seq_len and q_col < head_dim)
+                    q_batch[q_row * head_dim + q_col]
+                else
+                    0;
+            }
 
-    inline for (0..4) |acc_i| {
-        s_acc[acc_i] *= scale;
-    }
+            load_i = lane_id;
+            while (load_i < config.mma_k * config.flash_block_n) : (load_i += Backend.lanes) {
+                const kk = load_i / config.flash_block_n;
+                const col = load_i % config.flash_block_n;
+                const key_row = tile_start + col;
+                const key_col = k_start + kk;
+                shared_k_ptr[load_i] = if (key_row < seq_len and key_col < head_dim)
+                    k_batch[key_row * head_dim + key_col]
+                else
+                    0;
+            }
 
-    // 2. Row-wise Max (simplified: no causal mask)
-    var row_max: f32 = -1e20;
-    inline for (0..4) |acc_i| {
-        if (s_acc[acc_i] > row_max) row_max = s_acc[acc_i];
-    }
-    // Warp-level reduction for max across the row
-    // Each thread holds 4 values of the 16x16 S matrix.
-    inline for (.{ 16, 8, 4, 2, 1 }) |offset| {
-        const val_u32 = device.shfl_sync_bfly(0xFFFFFFFF, @bitCast(row_max), offset, 32);
-        row_max = @max(row_max, @as(f32, @bitCast(val_u32)));
-    }
+            blockBarrier();
 
-    // 3. Row-wise Sum of Exp(S - max)
-    var row_sum: f32 = 0;
-    inline for (0..4) |acc_i| {
-        s_acc[acc_i] = device.ex2_approx((s_acc[acc_i] - row_max) * 1.4426950408889634);
-        row_sum += s_acc[acc_i];
-    }
-    inline for (.{ 16, 8, 4, 2, 1 }) |offset| {
-        const val_u32 = device.shfl_sync_bfly(0xFFFFFFFF, @bitCast(row_sum), offset, 32);
-        row_sum += @as(f32, @bitCast(val_u32));
-    }
+            const q_frag = Backend.loadA(shared_q_ptr, config.mma_k, lane_id);
+            const k_frag = Backend.loadB(shared_k_ptr, config.flash_block_n, lane_id);
+            scores = Backend.mma(q_frag, k_frag, scores);
 
-    // 4. Normalize to get P
-    inline for (0..4) |acc_i| {
-        s_acc[acc_i] /= row_sum;
-    }
+            blockBarrier();
+        }
 
-    // Write P back to shared memory (cast to f16) to prepare for P * V
-    // P is 16x16.
-    const shared_p_ptr: [*]addrspace(.shared) f16 = @ptrCast(&mma_shared_a_1);
-    const shared_v_ptr: [*]addrspace(.shared) f16 = @ptrCast(&mma_shared_b_1);
+        inline for (0..4) |acc_i| {
+            const coord = Backend.accumulatorCoord(lane_id, acc_i);
+            const row = coord[0];
+            const col = coord[1];
+            const key_row = tile_start + col;
+            const q_row = q_base + row;
+            const visible = causal == 0 or key_row <= q_row;
+            scores[acc_i] = if (q_row < seq_len and key_row < seq_len and visible)
+                scores[acc_i] * scale
+            else
+                -std.math.inf(f32);
+            flash_scores_shared[row * config.flash_block_n + col] = scores[acc_i];
+        }
+
+        blockBarrier();
+
+        if (lane_id < config.flash_block_m * 2) {
+            const row = lane_id / 2;
+            const half = lane_id % 2;
+            var partial_max: f32 = -std.math.inf(f32);
+            inline for (0..4) |i| {
+                const col = half * 4 + i;
+                partial_max = @max(partial_max, flash_scores_shared[row * config.flash_block_n + col]);
+            }
+            reduce_shared[lane_id] = partial_max;
+        }
+
+        blockBarrier();
+
+        if (lane_id < config.flash_block_m) {
+            const row = lane_id;
+            const tile_max = @max(reduce_shared[row * 2], reduce_shared[row * 2 + 1]);
+            const old_m = flash_row_max_shared[row];
+            const old_l = flash_row_sum_shared[row];
+            const m_new = @max(old_m, tile_max);
+            const old_scale = if (old_l == 0) 0 else device.ex2_approx((old_m - m_new) * log2e);
+            flash_row_max_shared[row] = m_new;
+            flash_old_scale_shared[row] = old_scale;
+        }
+
+        blockBarrier();
+
+        if (lane_id < config.flash_block_m * 2) {
+            const row = lane_id / 2;
+            const half = lane_id % 2;
+            const m_new = flash_row_max_shared[row];
+            var partial_sum: f32 = 0;
+
+            inline for (0..4) |i| {
+                const col = half * 4 + i;
+                const key_row = tile_start + col;
+                const q_row = q_base + row;
+                const score = flash_scores_shared[row * config.flash_block_n + col];
+                const visible = causal == 0 or key_row <= q_row;
+                const weight = if (key_row < seq_len and q_row < seq_len and visible)
+                    device.ex2_approx((score - m_new) * log2e)
+                else
+                    0;
+                partial_sum += weight;
+                shared_p_ptr[row * config.mma_k + col] = @floatCast(weight);
+            }
+            reduce_shared[lane_id] = partial_sum;
+        }
+
+        blockBarrier();
+
+        if (lane_id < config.flash_block_m) {
+            const row = lane_id;
+            const old_l = flash_row_sum_shared[row];
+            const old_scale = flash_old_scale_shared[row];
+            const tile_sum = reduce_shared[row * 2] + reduce_shared[row * 2 + 1];
+
+            inline for (config.flash_block_n..config.mma_k) |col| {
+                shared_p_ptr[row * config.mma_k + col] = 0;
+            }
+
+            flash_row_sum_shared[row] = old_l * old_scale + tile_sum;
+        }
+
+        blockBarrier();
+
+        inline for (0..4) |acc_i| {
+            const coord = Backend.accumulatorCoord(lane_id, acc_i);
+            const row = coord[0];
+            const old_scale = flash_old_scale_shared[row];
+            o_acc_0[acc_i] *= old_scale;
+            o_acc_1[acc_i] *= old_scale;
+            o_acc_2[acc_i] *= old_scale;
+            o_acc_3[acc_i] *= old_scale;
+        }
+
+        inline for (0..4) |chunk| {
+            var load_i = lane_id;
+            while (load_i < config.mma_k * config.flash_block_n) : (load_i += Backend.lanes) {
+                const kk = load_i / config.flash_block_n;
+                const col = load_i % config.flash_block_n;
+                const key_row = tile_start + kk;
+                const out_col = chunk * config.flash_block_n + col;
+                shared_v_ptr[load_i] = if (kk < config.flash_block_n and key_row < seq_len and out_col < head_dim)
+                    v_batch[key_row * head_dim + out_col]
+                else
+                    0;
+            }
+
+            blockBarrier();
+
+            const p_frag = Backend.loadA(shared_p_ptr, config.mma_k, lane_id);
+            const v_frag = Backend.loadB(shared_v_ptr, config.flash_block_n, lane_id);
+            const pv = Backend.mma(p_frag, v_frag, Backend.zeroAccumulator());
+            inline for (0..4) |acc_i| {
+                if (chunk == 0) {
+                    o_acc_0[acc_i] += pv[acc_i];
+                } else if (chunk == 1) {
+                    o_acc_1[acc_i] += pv[acc_i];
+                } else if (chunk == 2) {
+                    o_acc_2[acc_i] += pv[acc_i];
+                } else if (chunk == 3) {
+                    o_acc_3[acc_i] += pv[acc_i];
+                }
+            }
+
+            blockBarrier();
+        }
+    }
 
     inline for (0..4) |acc_i| {
         const coord = Backend.accumulatorCoord(lane_id, acc_i);
         const row = coord[0];
         const col = coord[1];
-        shared_p_ptr[row * 16 + col] = @floatCast(s_acc[acc_i]);
-    }
+        const q_row = q_base + row;
+        const denom = flash_row_sum_shared[row];
 
-    // Load V
-    i = lane_id;
-    while (i < 16 * 16) : (i += 32) {
-        shared_v_ptr[i] = v[i];
-    }
-    blockBarrier();
-
-    // 5. Compute O = P * V
-    // V needs to be treated as col-major for the mma hardware if we want row*row
-    // Wait, mma.row.col expects B to be col-major. We stored V as row-major.
-    // For this simple demo, we will use loadA on P, loadB on V.
-    const p_frag = Backend.loadA(shared_p_ptr, 16, lane_id);
-    const v_frag = Backend.loadB(shared_v_ptr, 16, lane_id);
-
-    const o_acc = Backend.mma(p_frag, v_frag, Backend.zeroAccumulator());
-
-    // Write out O (16x16 f32)
-    inline for (0..4) |acc_i| {
-        const coord = Backend.accumulatorCoord(lane_id, acc_i);
-        const row = coord[0];
-        const col = coord[1];
-        o[row * 16 + col] = o_acc[acc_i];
+        if (q_row < seq_len) {
+            if (col < head_dim) {
+                o_batch[q_row * head_dim + col] = o_acc_0[acc_i] / denom;
+            }
+            if (col + config.flash_block_n < head_dim) {
+                o_batch[q_row * head_dim + col + config.flash_block_n] = o_acc_1[acc_i] / denom;
+            }
+            if (col + config.flash_block_n * 2 < head_dim) {
+                o_batch[q_row * head_dim + col + config.flash_block_n * 2] = o_acc_2[acc_i] / denom;
+            }
+            if (col + config.flash_block_n * 3 < head_dim) {
+                o_batch[q_row * head_dim + col + config.flash_block_n * 3] = o_acc_3[acc_i] / denom;
+            }
+        }
     }
 }

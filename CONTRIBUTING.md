@@ -19,7 +19,7 @@ zig build -Dgpu=sm_86
 zig build run -- all
 ```
 
-`benchmark` and `flash` are explicit demos. They are not part of the deterministic `all` smoke path.
+`benchmark` is an explicit demo. It is not part of the deterministic `all` smoke path.
 
 ## Public API
 

@@ -3,6 +3,7 @@ const cuda = @import("cuda.zig");
 const layout = @import("layout.zig");
 const config = @import("config.zig");
 const benchmark = @import("benchmark.zig");
+const flash = @import("flash.zig");
 
 pub const std_options: std.Options = .{
     .log_level = .info,
@@ -65,6 +66,7 @@ pub fn main() !void {
         try runBatchedMma(module);
         try runPipelinedMma(module);
         try runEpilogueDemo(module);
+        try runFlashAttention(module);
         try runOccupancyDemo();
     } else {
         std.log.err("Unknown demo: {s}", .{cmd});
@@ -89,51 +91,102 @@ fn runOccupancyDemo() !void {
 }
 
 fn runFlashAttention(module: cuda.Module) !void {
-    const seq_len = 16;
-    const head_dim = 16;
-    const len = seq_len * head_dim;
+    try runFlashCase(module, 2, 32, 32, 32 * 32 + 17, 32 * 32 + 19, 32 * 32 + 23, 32 * 32 + 29, true);
+    try runFlashCase(module, 1, 17, 16, 17 * 16 + 3, 17 * 16 + 5, 17 * 16 + 7, 17 * 16 + 11, false);
+    try runFlashCase(module, 3, 49, 16, 49 * 16, 49 * 16 + 13, 49 * 16 + 17, 49 * 16 + 19, true);
+}
 
-    var q: [len]f16 = undefined;
-    var k: [len]f16 = undefined;
-    var v: [len]f16 = undefined;
-    var o: [len]f32 = undefined;
+fn runFlashCase(
+    module: cuda.Module,
+    comptime batch_heads: usize,
+    comptime seq_len: usize,
+    comptime head_dim: usize,
+    comptime q_stride: usize,
+    comptime k_stride: usize,
+    comptime v_stride: usize,
+    comptime o_stride: usize,
+    comptime causal: bool,
+) !void {
+    const q_storage_len = batch_heads * q_stride;
+    const k_storage_len = batch_heads * k_stride;
+    const v_storage_len = batch_heads * v_stride;
+    const o_storage_len = batch_heads * o_stride;
+    const active_len = seq_len * head_dim;
 
-    for (0..len) |i| {
-        q[i] = @floatFromInt(i % 5);
-        k[i] = @floatFromInt(i % 3);
-        v[i] = @floatFromInt(i % 2);
-    }
+    var q: [q_storage_len]f16 = undefined;
+    var k: [k_storage_len]f16 = undefined;
+    var v: [v_storage_len]f16 = undefined;
+    var o: [o_storage_len]f32 = undefined;
+    var expected: [o_storage_len]f32 = undefined;
 
-    const d_q = try cuda.malloc(f16, len);
+    fillFlashInput(&q, 3, 1, 0.125);
+    fillFlashInput(&k, 5, 2, 0.0625);
+    fillFlashInput(&v, 7, 3, 0.03125);
+    for (&o) |*item| item.* = 0;
+    for (&expected) |*item| item.* = 0;
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    computeFlashReference(
+        batch_heads,
+        seq_len,
+        head_dim,
+        q_stride,
+        k_stride,
+        v_stride,
+        o_stride,
+        &q,
+        &k,
+        &v,
+        &expected,
+        scale,
+        if (causal) 1 else 0,
+    );
+
+    const d_q = try cuda.malloc(f16, q_storage_len);
     defer cuda.free(d_q);
 
-    const d_k = try cuda.malloc(f16, len);
+    const d_k = try cuda.malloc(f16, k_storage_len);
     defer cuda.free(d_k);
 
-    const d_v = try cuda.malloc(f16, len);
+    const d_v = try cuda.malloc(f16, v_storage_len);
     defer cuda.free(d_v);
 
-    const d_o = try cuda.malloc(f32, len);
+    const d_o = try cuda.malloc(f32, o_storage_len);
     defer cuda.free(d_o);
 
     try cuda.memcpy(f16, d_q, &q, .host_to_device);
     try cuda.memcpy(f16, d_k, &k, .host_to_device);
     try cuda.memcpy(f16, d_v, &v, .host_to_device);
+    try cuda.memcpy(f32, d_o, &o, .host_to_device);
 
-    const kernel = try module.getFunction("flash_attention_fwd");
-    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-
-    try kernel.launch(
-        .{
-            .grid_dim = .{ .x = 1 },
-            .block_dim = .{ .x = 32 },
-        },
-        .{ d_q.ptr, d_k.ptr, d_v.ptr, d_o.ptr, seq_len, head_dim, scale },
-    );
+    try flash.launch(module, d_q, d_k, d_v, d_o, .{
+        .batch_heads = batch_heads,
+        .seq_len = seq_len,
+        .head_dim = head_dim,
+        .q_stride = q_stride,
+        .k_stride = k_stride,
+        .v_stride = v_stride,
+        .o_stride = o_stride,
+        .scale = scale,
+        .causal = causal,
+    });
 
     try cuda.memcpy(f32, &o, d_o, .device_to_host);
 
-    std.log.warn("flash attention is experimental: ran simplified 16x16 forward pass without CPU reference validation", .{});
+    for (0..batch_heads) |batch| {
+        for (0..active_len) |i| {
+            const out_idx = batch * o_stride + i;
+            const actual = o[out_idx];
+            const want = expected[out_idx];
+            const diff = @abs(actual - want);
+            if (diff > 0.008) {
+                std.log.err("flash mismatch at batch {} idx {}: expected {}, got {}, diff {}", .{ batch, i, want, actual, diff });
+                return error.FlashAttentionMismatch;
+            }
+        }
+    }
+
+    std.log.info("flash attention OK: batch_heads={}, causal={}, Q/K/V/O={}x{}", .{ batch_heads, causal, seq_len, head_dim });
 }
 
 fn runEpilogueDemo(module: cuda.Module) !void {
@@ -603,6 +656,106 @@ fn runBenchmarkDemo(module: cuda.Module) !void {
     }, kernel, best_cfg, args);
 
     res.print("vector_add (Best Config)");
+
+    try runFlashBenchmark(module);
+}
+
+fn runFlashBenchmark(module: cuda.Module) !void {
+    try runFlashBenchmarkCase(module, 2, 32, 16, false);
+    try runFlashBenchmarkCase(module, 2, 32, 32, true);
+    try runFlashBenchmarkCase(module, 2, 64, 16, false);
+    try runFlashBenchmarkCase(module, 2, 64, 32, true);
+    try runFlashBenchmarkCase(module, 2, 128, 32, true);
+}
+
+fn runFlashBenchmarkCase(
+    module: cuda.Module,
+    comptime batch_heads: usize,
+    comptime seq_len: usize,
+    comptime head_dim: usize,
+    comptime causal: bool,
+) !void {
+    const stride = seq_len * head_dim;
+    const storage_len = batch_heads * stride;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    var q: [storage_len]f16 = undefined;
+    var k: [storage_len]f16 = undefined;
+    var v: [storage_len]f16 = undefined;
+
+    for (&q, 0..) |*item, i| {
+        item.* = @floatCast(@as(f32, @floatFromInt((i * 3 + 1) % 11)) * 0.125);
+    }
+    for (&k, 0..) |*item, i| {
+        item.* = @floatCast(@as(f32, @floatFromInt((i * 5 + 2) % 13)) * 0.0625);
+    }
+    for (&v, 0..) |*item, i| {
+        item.* = @floatCast(@as(f32, @floatFromInt((i * 7 + 3) % 17)) * 0.03125);
+    }
+
+    const d_q = try cuda.malloc(f16, storage_len);
+    defer cuda.free(d_q);
+
+    const d_k = try cuda.malloc(f16, storage_len);
+    defer cuda.free(d_k);
+
+    const d_v = try cuda.malloc(f16, storage_len);
+    defer cuda.free(d_v);
+
+    const d_o = try cuda.malloc(f32, storage_len);
+    defer cuda.free(d_o);
+
+    try cuda.memcpy(f16, d_q, &q, .host_to_device);
+    try cuda.memcpy(f16, d_k, &k, .host_to_device);
+    try cuda.memcpy(f16, d_v, &v, .host_to_device);
+
+    const opts = flash.Options{
+        .batch_heads = batch_heads,
+        .seq_len = seq_len,
+        .head_dim = head_dim,
+        .q_stride = stride,
+        .k_stride = stride,
+        .v_stride = stride,
+        .o_stride = stride,
+        .scale = scale,
+        .causal = causal,
+    };
+    const kernel = try module.getFunction("flash_attention_fwd");
+    const cfg = cuda.LaunchConfig{
+        .grid_dim = .{
+            .x = @intCast((seq_len + config.flash_block_m - 1) / config.flash_block_m),
+            .y = @intCast(batch_heads),
+        },
+        .block_dim = .{ .x = 32 },
+    };
+    const args = .{
+        d_q.ptr,
+        d_k.ptr,
+        d_v.ptr,
+        d_o.ptr,
+        opts.seq_len,
+        opts.head_dim,
+        opts.q_stride,
+        opts.k_stride,
+        opts.v_stride,
+        opts.o_stride,
+        opts.scale,
+        @as(u32, if (opts.causal) 1 else 0),
+    };
+    const effective_seq = if (causal) (seq_len * (seq_len + 1)) / 2 else seq_len * seq_len;
+    const flops = batch_heads * (4 * effective_seq * head_dim);
+    const bytes = storage_len * (@sizeOf(f16) * 3 + @sizeOf(f32));
+
+    const res = try benchmark.runKernel(.{
+        .warmup_iters = 5,
+        .iters = 20,
+        .bytes_processed = bytes,
+        .flops_processed = flops,
+    }, kernel, cfg, args);
+
+    var name_buf: [96]u8 = undefined;
+    const name = try std.fmt.bufPrint(&name_buf, "flash_attention_fwd seq={} head={} causal={}", .{ seq_len, head_dim, causal });
+    res.print(name);
 }
 
 fn runMmaMatmul(module: cuda.Module) !void {
@@ -759,6 +912,79 @@ fn computePipelineReference(comptime k_iters: usize, a: *const [config.mma_m * c
             var out = alpha * acc + beta * c[c_layout.offset(.{ row, col })];
             if (epilogue == .relu) out = @max(0.0, out);
             d[c_layout.offset(.{ row, col })] = out;
+        }
+    }
+}
+
+fn fillFlashInput(data: []f16, mul: usize, add: usize, scale: f32) void {
+    for (data, 0..) |*item, i| {
+        item.* = @floatCast(@as(f32, @floatFromInt((i * mul + add) % 17)) * scale);
+    }
+}
+
+fn computeFlashReference(
+    comptime batch_heads: usize,
+    comptime seq_len: usize,
+    comptime head_dim: usize,
+    comptime q_stride: usize,
+    comptime k_stride: usize,
+    comptime v_stride: usize,
+    comptime o_stride: usize,
+    q: *const [batch_heads * q_stride]f16,
+    k: *const [batch_heads * k_stride]f16,
+    v: *const [batch_heads * v_stride]f16,
+    o: *[batch_heads * o_stride]f32,
+    scale: f32,
+    causal: u32,
+) void {
+    for (0..batch_heads) |batch| {
+        computeFlashReferenceOne(
+            seq_len,
+            head_dim,
+            q[batch * q_stride ..][0..q_stride],
+            k[batch * k_stride ..][0..k_stride],
+            v[batch * v_stride ..][0..v_stride],
+            o[batch * o_stride ..][0..o_stride],
+            scale,
+            causal,
+        );
+    }
+}
+
+fn computeFlashReferenceOne(comptime seq_len: usize, comptime head_dim: usize, q: []const f16, k: []const f16, v: []const f16, o: []f32, scale: f32, causal: u32) void {
+    for (0..seq_len) |row| {
+        var scores: [seq_len]f32 = undefined;
+        var row_max: f32 = -std.math.inf(f32);
+
+        for (0..seq_len) |key_col| {
+            if (causal != 0 and key_col > row) {
+                scores[key_col] = -std.math.inf(f32);
+            } else {
+                var score: f32 = 0;
+                for (0..head_dim) |kk| {
+                    score += @as(f32, @floatCast(q[row * head_dim + kk])) *
+                        @as(f32, @floatCast(k[key_col * head_dim + kk]));
+                }
+                score *= scale;
+                scores[key_col] = score;
+                row_max = @max(row_max, score);
+            }
+        }
+
+        var row_sum: f32 = 0;
+        for (0..seq_len) |key_col| {
+            const weight = if (scores[key_col] == -std.math.inf(f32)) 0 else @exp(scores[key_col] - row_max);
+            scores[key_col] = weight;
+            row_sum += weight;
+        }
+
+        for (0..head_dim) |out_col| {
+            var acc: f32 = 0;
+            for (0..seq_len) |key_col| {
+                const weight = scores[key_col] / row_sum;
+                acc += weight * @as(f32, @floatCast(v[key_col * head_dim + out_col]));
+            }
+            o[row * head_dim + out_col] = acc;
         }
     }
 }

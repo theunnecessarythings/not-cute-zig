@@ -8,6 +8,7 @@ The reusable package entrypoint is `not-cute`, backed by `src/not_cute.zig`. It 
 - `mma`: descriptor-driven warp-level MMA backends
 - `device`: device-side helpers and SM80+ primitives
 - `cuda`: CUDA driver API wrappers for host allocation, module loading, launches, streams, events, and synchronization
+- `flash`: host-side flash-attention launch options and validation for supported shapes
 - `benchmark`: event-based runtime benchmarking helpers
 
 The current demo binary runs:
@@ -17,7 +18,8 @@ The current demo binary runs:
 - CTA/warp/lane/value ownership mapping
 - one `m16n8k16` f16 -> f32 MMA matmul tile using `ldmatrix` and `mma.sync`
 - batched and pipelined MMA smoke checks with CPU references
-- optional benchmark and experimental flash-attention demos
+- multi-block flash-attention smoke check with a CPU reference
+- optional benchmark demo
 
 ## Requirements
 
@@ -64,11 +66,18 @@ Run deterministic GPU smoke demos:
 zig build run -- all
 ```
 
+The current flash-attention kernel computes single-head self-attention for row-major
+`Q/K/V/O` tensors with explicit element strides per flattened batch/head slice.
+It uses query CTAs, shared-memory K/V tiles, tensor cores for QK and PV,
+lane-parallel row max/sum reductions, causal masking, and online softmax state
+across K/V tiles. The current implementation supports `head_dim == 16` or `32`;
+the smoke test validates two padded causal `32x32` slices, and `benchmark` includes
+causal/non-causal flash timing runs for `seq_len` 32, 64, and 128.
+
 Run explicit non-smoke demos:
 
 ```sh
 zig build run -- benchmark
-zig build run -- flash
 ```
 
 ## Modal
