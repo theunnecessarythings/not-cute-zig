@@ -15,7 +15,7 @@ pub const Options = struct {
 
     pub fn validate(self: Options) !void {
         if (self.batch_heads == 0 or self.seq_len == 0) return error.InvalidValue;
-        if (self.head_dim != 16 and self.head_dim != 32) return error.InvalidValue;
+        if (self.head_dim != 16 and self.head_dim != 32 and self.head_dim != 64) return error.InvalidValue;
 
         const min_stride = self.seq_len * self.head_dim;
         if (self.q_stride < min_stride or
@@ -49,7 +49,7 @@ pub fn launch(
                 .x = @intCast((opts.seq_len + config.flash_block_m - 1) / config.flash_block_m),
                 .y = @intCast(opts.batch_heads),
             },
-            .block_dim = .{ .x = 32 },
+            .block_dim = .{ .x = config.flash_warps * 32 },
         },
         .{
             q.ptr,

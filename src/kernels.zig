@@ -11,11 +11,13 @@ var mma_shared_a: [config.mma_m * config.mma_k]f16 addrspace(.shared) = undefine
 var mma_shared_b: [config.mma_k * config.mma_n]f16 addrspace(.shared) = undefined;
 var mma_shared_a_1: [config.mma_m * config.mma_k]f16 addrspace(.shared) = undefined;
 var mma_shared_b_1: [config.mma_k * config.mma_n]f16 addrspace(.shared) = undefined;
-var reduce_shared: [32]f32 addrspace(.shared) = undefined;
-var flash_shared_q: [config.flash_block_m * config.flash_max_head_dim]f16 addrspace(.shared) = undefined;
-var flash_shared_k: [config.flash_block_n * config.flash_max_head_dim]f16 addrspace(.shared) = undefined;
-var flash_shared_v: [config.flash_block_n * config.flash_max_head_dim]f16 addrspace(.shared) = undefined;
-var flash_shared_p: [config.flash_block_m * config.flash_max_head_dim]f16 addrspace(.shared) = undefined;
+var reduce_shared: [64]f32 addrspace(.shared) = undefined;
+var flash_shared_q: [config.flash_warps * config.flash_block_m * config.mma_k]f16 addrspace(.shared) = undefined;
+var flash_shared_k: [config.flash_warps * config.mma_k * config.flash_mma_n]f16 addrspace(.shared) = undefined;
+var flash_shared_v: [config.flash_warps * config.mma_k * config.flash_mma_n]f16 addrspace(.shared) = undefined;
+var flash_shared_p: [config.flash_block_m * config.mma_k]f16 addrspace(.shared) = undefined;
+var flash_shared_p_mma: [config.flash_warps * config.flash_block_m * config.mma_k]f16 addrspace(.shared) = undefined;
+var flash_pv_partial_shared: [config.flash_warps * config.flash_block_m * config.flash_max_head_dim]f32 addrspace(.shared) = undefined;
 var flash_scores_shared: [config.flash_block_m * config.flash_block_n]f32 addrspace(.shared) = undefined;
 var flash_row_max_shared: [config.flash_block_m]f32 addrspace(.shared) = undefined;
 var flash_row_sum_shared: [config.flash_block_m]f32 addrspace(.shared) = undefined;
@@ -389,11 +391,13 @@ pub fn flash_attention_fwd(
     scale: f32,
     causal: u32,
 ) callconv(.kernel) void {
-    if (seq_len == 0 or (head_dim != 16 and head_dim != 32)) return;
+    if (seq_len == 0 or (head_dim != 16 and head_dim != 32 and head_dim != 64)) return;
 
     const Backend = mma.Backend(mma.m16n8k16_f16_f32);
-    const lane_id = @workItemId(0);
-    if (lane_id >= Backend.lanes) return;
+    const thread_id = @workItemId(0);
+    const warp_id = thread_id / Backend.lanes;
+    const lane_id = thread_id % Backend.lanes;
+    if (warp_id >= config.flash_warps) return;
 
     const log2e = 1.4426950408889634;
     const q_base = @workGroupId(0) * config.flash_block_m;
@@ -403,26 +407,33 @@ pub fn flash_attention_fwd(
     const v_batch = v + batch_id * v_stride;
     const o_batch = o + batch_id * o_stride;
 
-    const shared_q_ptr: [*]addrspace(.shared) f16 = @ptrCast(&flash_shared_q);
-    const shared_k_ptr: [*]addrspace(.shared) f16 = @ptrCast(&flash_shared_k);
-    const shared_v_ptr: [*]addrspace(.shared) f16 = @ptrCast(&flash_shared_v);
+    const shared_q_all_ptr: [*]addrspace(.shared) f16 = @ptrCast(&flash_shared_q);
+    const shared_k_all_ptr: [*]addrspace(.shared) f16 = @ptrCast(&flash_shared_k);
+    const shared_v_all_ptr: [*]addrspace(.shared) f16 = @ptrCast(&flash_shared_v);
     const shared_p_ptr: [*]addrspace(.shared) f16 = @ptrCast(&flash_shared_p);
+    const shared_p_mma_all_ptr: [*]addrspace(.shared) f16 = @ptrCast(&flash_shared_p_mma);
+    const pv_partial_ptr: [*]addrspace(.shared) f32 = @ptrCast(&flash_pv_partial_shared);
+    const shared_q_ptr = shared_q_all_ptr + warp_id * config.flash_block_m * config.mma_k;
+    const shared_k_ptr = shared_k_all_ptr + warp_id * config.mma_k * config.flash_mma_n;
+    const shared_v_ptr = shared_v_all_ptr + warp_id * config.mma_k * config.flash_mma_n;
+    const shared_p_mma_ptr = shared_p_mma_all_ptr + warp_id * config.flash_block_m * config.mma_k;
 
-    var o_acc_0 = Backend.zeroAccumulator();
-    var o_acc_1 = Backend.zeroAccumulator();
-    var o_acc_2 = Backend.zeroAccumulator();
-    var o_acc_3 = Backend.zeroAccumulator();
+    var o_acc: [config.flash_max_head_dim / config.flash_mma_n]Backend.Accumulator = undefined;
+    inline for (0..config.flash_max_head_dim / config.flash_mma_n) |chunk| {
+        o_acc[chunk] = Backend.zeroAccumulator();
+    }
 
-    if (lane_id < config.flash_block_m) {
-        flash_row_max_shared[lane_id] = -std.math.inf(f32);
-        flash_row_sum_shared[lane_id] = 0;
-        flash_old_scale_shared[lane_id] = 0;
+    if (thread_id < config.flash_block_m) {
+        flash_row_max_shared[thread_id] = -std.math.inf(f32);
+        flash_row_sum_shared[thread_id] = 0;
+        flash_old_scale_shared[thread_id] = 0;
     }
 
     blockBarrier();
 
     var tile_start: usize = 0;
     while (tile_start < seq_len) : (tile_start += config.flash_block_n) {
+        const n_part = warp_id;
         var scores = Backend.zeroAccumulator();
 
         var k_start: usize = 0;
@@ -440,10 +451,10 @@ pub fn flash_attention_fwd(
             }
 
             load_i = lane_id;
-            while (load_i < config.mma_k * config.flash_block_n) : (load_i += Backend.lanes) {
-                const kk = load_i / config.flash_block_n;
-                const col = load_i % config.flash_block_n;
-                const key_row = tile_start + col;
+            while (load_i < config.mma_k * config.flash_mma_n) : (load_i += Backend.lanes) {
+                const kk = load_i / config.flash_mma_n;
+                const col = load_i % config.flash_mma_n;
+                const key_row = tile_start + n_part * config.flash_mma_n + col;
                 const key_col = k_start + kk;
                 shared_k_ptr[load_i] = if (key_row < seq_len and key_col < head_dim)
                     k_batch[key_row * head_dim + key_col]
@@ -454,7 +465,7 @@ pub fn flash_attention_fwd(
             blockBarrier();
 
             const q_frag = Backend.loadA(shared_q_ptr, config.mma_k, lane_id);
-            const k_frag = Backend.loadB(shared_k_ptr, config.flash_block_n, lane_id);
+            const k_frag = Backend.loadB(shared_k_ptr, config.flash_mma_n, lane_id);
             scores = Backend.mma(q_frag, k_frag, scores);
 
             blockBarrier();
@@ -464,34 +475,35 @@ pub fn flash_attention_fwd(
             const coord = Backend.accumulatorCoord(lane_id, acc_i);
             const row = coord[0];
             const col = coord[1];
-            const key_row = tile_start + col;
+            const block_col = n_part * config.flash_mma_n + col;
+            const key_row = tile_start + block_col;
             const q_row = q_base + row;
             const visible = causal == 0 or key_row <= q_row;
             scores[acc_i] = if (q_row < seq_len and key_row < seq_len and visible)
                 scores[acc_i] * scale
             else
                 -std.math.inf(f32);
-            flash_scores_shared[row * config.flash_block_n + col] = scores[acc_i];
+            flash_scores_shared[row * config.flash_block_n + block_col] = scores[acc_i];
         }
 
         blockBarrier();
 
-        if (lane_id < config.flash_block_m * 2) {
-            const row = lane_id / 2;
-            const half = lane_id % 2;
+        if (thread_id < config.flash_block_m * 4) {
+            const row = thread_id / 4;
+            const quarter = thread_id % 4;
             var partial_max: f32 = -std.math.inf(f32);
             inline for (0..4) |i| {
-                const col = half * 4 + i;
+                const col = quarter * 4 + i;
                 partial_max = @max(partial_max, flash_scores_shared[row * config.flash_block_n + col]);
             }
-            reduce_shared[lane_id] = partial_max;
+            reduce_shared[thread_id] = partial_max;
         }
 
         blockBarrier();
 
-        if (lane_id < config.flash_block_m) {
-            const row = lane_id;
-            const tile_max = @max(reduce_shared[row * 2], reduce_shared[row * 2 + 1]);
+        if (thread_id < config.flash_block_m) {
+            const row = thread_id;
+            const tile_max = @max(@max(reduce_shared[row * 4], reduce_shared[row * 4 + 1]), @max(reduce_shared[row * 4 + 2], reduce_shared[row * 4 + 3]));
             const old_m = flash_row_max_shared[row];
             const old_l = flash_row_sum_shared[row];
             const m_new = @max(old_m, tile_max);
@@ -502,14 +514,14 @@ pub fn flash_attention_fwd(
 
         blockBarrier();
 
-        if (lane_id < config.flash_block_m * 2) {
-            const row = lane_id / 2;
-            const half = lane_id % 2;
+        if (thread_id < config.flash_block_m * 4) {
+            const row = thread_id / 4;
+            const quarter = thread_id % 4;
             const m_new = flash_row_max_shared[row];
             var partial_sum: f32 = 0;
 
             inline for (0..4) |i| {
-                const col = half * 4 + i;
+                const col = quarter * 4 + i;
                 const key_row = tile_start + col;
                 const q_row = q_base + row;
                 const score = flash_scores_shared[row * config.flash_block_n + col];
@@ -521,63 +533,82 @@ pub fn flash_attention_fwd(
                 partial_sum += weight;
                 shared_p_ptr[row * config.mma_k + col] = @floatCast(weight);
             }
-            reduce_shared[lane_id] = partial_sum;
+            reduce_shared[thread_id] = partial_sum;
         }
 
         blockBarrier();
 
-        if (lane_id < config.flash_block_m) {
-            const row = lane_id;
+        if (thread_id < config.flash_block_m) {
+            const row = thread_id;
             const old_l = flash_row_sum_shared[row];
             const old_scale = flash_old_scale_shared[row];
-            const tile_sum = reduce_shared[row * 2] + reduce_shared[row * 2 + 1];
-
-            inline for (config.flash_block_n..config.mma_k) |col| {
-                shared_p_ptr[row * config.mma_k + col] = 0;
-            }
+            const tile_sum = reduce_shared[row * 4] + reduce_shared[row * 4 + 1] + reduce_shared[row * 4 + 2] + reduce_shared[row * 4 + 3];
 
             flash_row_sum_shared[row] = old_l * old_scale + tile_sum;
         }
 
         blockBarrier();
 
-        inline for (0..4) |acc_i| {
-            const coord = Backend.accumulatorCoord(lane_id, acc_i);
-            const row = coord[0];
-            const old_scale = flash_old_scale_shared[row];
-            o_acc_0[acc_i] *= old_scale;
-            o_acc_1[acc_i] *= old_scale;
-            o_acc_2[acc_i] *= old_scale;
-            o_acc_3[acc_i] *= old_scale;
+        if (warp_id == 0) {
+            inline for (0..4) |acc_i| {
+                const coord = Backend.accumulatorCoord(lane_id, acc_i);
+                const row = coord[0];
+                const old_scale = flash_old_scale_shared[row];
+                inline for (0..config.flash_max_head_dim / config.flash_mma_n) |chunk| {
+                    o_acc[chunk][acc_i] *= old_scale;
+                }
+            }
         }
 
-        inline for (0..4) |chunk| {
+        inline for (0..config.flash_max_head_dim / config.flash_mma_n) |chunk| {
             var load_i = lane_id;
-            while (load_i < config.mma_k * config.flash_block_n) : (load_i += Backend.lanes) {
-                const kk = load_i / config.flash_block_n;
-                const col = load_i % config.flash_block_n;
-                const key_row = tile_start + kk;
-                const out_col = chunk * config.flash_block_n + col;
-                shared_v_ptr[load_i] = if (kk < config.flash_block_n and key_row < seq_len and out_col < head_dim)
+            while (load_i < config.mma_k * config.flash_mma_n) : (load_i += Backend.lanes) {
+                const kk = load_i / config.flash_mma_n;
+                const col = load_i % config.flash_mma_n;
+                const key_row = tile_start + n_part * config.flash_mma_n + kk;
+                const out_col = chunk * config.flash_mma_n + col;
+                shared_v_ptr[load_i] = if (kk < config.flash_mma_n and key_row < seq_len and out_col < head_dim)
                     v_batch[key_row * head_dim + out_col]
+                else
+                    0;
+            }
+
+            var p_load_i = lane_id;
+            while (p_load_i < config.flash_block_m * config.mma_k) : (p_load_i += Backend.lanes) {
+                const row = p_load_i / config.mma_k;
+                const col = p_load_i % config.mma_k;
+                shared_p_mma_ptr[row * config.mma_k + col] = if (col < config.flash_mma_n)
+                    shared_p_ptr[row * config.mma_k + n_part * config.flash_mma_n + col]
                 else
                     0;
             }
 
             blockBarrier();
 
-            const p_frag = Backend.loadA(shared_p_ptr, config.mma_k, lane_id);
-            const v_frag = Backend.loadB(shared_v_ptr, config.flash_block_n, lane_id);
+            const p_frag = Backend.loadA(shared_p_mma_ptr, config.mma_k, lane_id);
+            const v_frag = Backend.loadB(shared_v_ptr, config.flash_mma_n, lane_id);
             const pv = Backend.mma(p_frag, v_frag, Backend.zeroAccumulator());
             inline for (0..4) |acc_i| {
-                if (chunk == 0) {
-                    o_acc_0[acc_i] += pv[acc_i];
-                } else if (chunk == 1) {
-                    o_acc_1[acc_i] += pv[acc_i];
-                } else if (chunk == 2) {
-                    o_acc_2[acc_i] += pv[acc_i];
-                } else if (chunk == 3) {
-                    o_acc_3[acc_i] += pv[acc_i];
+                const coord = Backend.accumulatorCoord(lane_id, acc_i);
+                const row = coord[0];
+                const col = coord[1];
+                const out_col = chunk * config.flash_mma_n + col;
+                pv_partial_ptr[warp_id * config.flash_block_m * config.flash_max_head_dim + row * config.flash_max_head_dim + out_col] = pv[acc_i];
+            }
+
+            blockBarrier();
+
+            if (warp_id == 0) {
+                inline for (0..4) |acc_i| {
+                    const coord = Backend.accumulatorCoord(lane_id, acc_i);
+                    const row = coord[0];
+                    const col = coord[1];
+                    const out_col = chunk * config.flash_mma_n + col;
+                    var pv_sum: f32 = 0;
+                    inline for (0..config.flash_warps) |partial_warp| {
+                        pv_sum += pv_partial_ptr[partial_warp * config.flash_block_m * config.flash_max_head_dim + row * config.flash_max_head_dim + out_col];
+                    }
+                    o_acc[chunk][acc_i] += pv_sum;
                 }
             }
 
@@ -585,25 +616,21 @@ pub fn flash_attention_fwd(
         }
     }
 
-    inline for (0..4) |acc_i| {
-        const coord = Backend.accumulatorCoord(lane_id, acc_i);
-        const row = coord[0];
-        const col = coord[1];
-        const q_row = q_base + row;
-        const denom = flash_row_sum_shared[row];
+    if (warp_id == 0) {
+        inline for (0..4) |acc_i| {
+            const coord = Backend.accumulatorCoord(lane_id, acc_i);
+            const row = coord[0];
+            const col = coord[1];
+            const q_row = q_base + row;
+            const denom = flash_row_sum_shared[row];
 
-        if (q_row < seq_len) {
-            if (col < head_dim) {
-                o_batch[q_row * head_dim + col] = o_acc_0[acc_i] / denom;
-            }
-            if (col + config.flash_block_n < head_dim) {
-                o_batch[q_row * head_dim + col + config.flash_block_n] = o_acc_1[acc_i] / denom;
-            }
-            if (col + config.flash_block_n * 2 < head_dim) {
-                o_batch[q_row * head_dim + col + config.flash_block_n * 2] = o_acc_2[acc_i] / denom;
-            }
-            if (col + config.flash_block_n * 3 < head_dim) {
-                o_batch[q_row * head_dim + col + config.flash_block_n * 3] = o_acc_3[acc_i] / denom;
+            if (q_row < seq_len) {
+                inline for (0..config.flash_max_head_dim / config.flash_mma_n) |chunk| {
+                    const out_col = col + config.flash_mma_n * chunk;
+                    if (out_col < head_dim) {
+                        o_batch[q_row * head_dim + out_col] = o_acc[chunk][acc_i] / denom;
+                    }
+                }
             }
         }
     }

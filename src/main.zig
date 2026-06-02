@@ -9,7 +9,7 @@ pub const std_options: std.Options = .{
     .log_level = .info,
 };
 
-const demo_list = "vector-add, transpose, ownership, mma, streams, reduction, batched-mma, pipeline, epilogue, occupancy, benchmark, flash, all";
+const demo_list = "vector-add, transpose, ownership, mma, streams, reduction, batched-mma, pipeline, epilogue, occupancy, benchmark, flash, compare, profile-flash, all";
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -56,6 +56,10 @@ pub fn main() !void {
         try runOccupancyDemo();
     } else if (std.mem.eql(u8, cmd, "benchmark")) {
         try runBenchmarkDemo(module);
+    } else if (std.mem.eql(u8, cmd, "compare")) {
+        try runCompareDemo(alloc, module);
+    } else if (std.mem.eql(u8, cmd, "profile-flash")) {
+        try runProfileFlash(alloc, module);
     } else if (std.mem.eql(u8, cmd, "all")) {
         try runVectorAdd(module);
         try runMatrixTranspose(module);
@@ -72,6 +76,52 @@ pub fn main() !void {
         std.log.err("Unknown demo: {s}", .{cmd});
         return error.UnknownCommand;
     }
+}
+
+fn runProfileFlash(alloc: std.mem.Allocator, module: cuda.Module) !void {
+    std.log.info("profile: not-cute flash batch_heads=8 seq=1024 head=64 causal=true", .{});
+    try compareFlash(alloc, module, 8, 1024, 64, true);
+}
+
+fn runCompareDemo(alloc: std.mem.Allocator, module: cuda.Module) !void {
+    std.log.info("compare: not-cute vector_add", .{});
+    try compareVectorAdd(module);
+    std.log.info("compare: not-cute transpose", .{});
+    try compareTranspose(module);
+    std.log.info("compare: not-cute reduction", .{});
+    try compareReduction(module);
+    std.log.info("compare: not-cute mma_gemm", .{});
+    try compareMma(module);
+    std.log.info("compare: not-cute flash batch_heads=2 seq=32 head=16 causal=false", .{});
+    try compareFlash(alloc, module, 2, 32, 16, false);
+    std.log.info("compare: not-cute flash batch_heads=2 seq=32 head=32 causal=true", .{});
+    try compareFlash(alloc, module, 2, 32, 32, true);
+    std.log.info("compare: not-cute flash batch_heads=2 seq=64 head=16 causal=false", .{});
+    try compareFlash(alloc, module, 2, 64, 16, false);
+    std.log.info("compare: not-cute flash batch_heads=2 seq=64 head=32 causal=true", .{});
+    try compareFlash(alloc, module, 2, 64, 32, true);
+    std.log.info("compare: not-cute flash batch_heads=2 seq=128 head=32 causal=true", .{});
+    try compareFlash(alloc, module, 2, 128, 32, true);
+    std.log.info("compare: not-cute flash batch_heads=8 seq=128 head=16 causal=false", .{});
+    try compareFlash(alloc, module, 8, 128, 16, false);
+    std.log.info("compare: not-cute flash batch_heads=8 seq=128 head=32 causal=true", .{});
+    try compareFlash(alloc, module, 8, 128, 32, true);
+    std.log.info("compare: not-cute flash batch_heads=8 seq=256 head=16 causal=false", .{});
+    try compareFlash(alloc, module, 8, 256, 16, false);
+    std.log.info("compare: not-cute flash batch_heads=8 seq=256 head=32 causal=true", .{});
+    try compareFlash(alloc, module, 8, 256, 32, true);
+    std.log.info("compare: not-cute flash batch_heads=16 seq=256 head=32 causal=false", .{});
+    try compareFlash(alloc, module, 16, 256, 32, false);
+    std.log.info("compare: not-cute flash batch_heads=16 seq=512 head=32 causal=true", .{});
+    try compareFlash(alloc, module, 16, 512, 32, true);
+    std.log.info("compare: not-cute flash batch_heads=8 seq=256 head=64 causal=false", .{});
+    try compareFlash(alloc, module, 8, 256, 64, false);
+    std.log.info("compare: not-cute flash batch_heads=8 seq=512 head=64 causal=true", .{});
+    try compareFlash(alloc, module, 8, 512, 64, true);
+    std.log.info("compare: not-cute flash batch_heads=16 seq=512 head=64 causal=false", .{});
+    try compareFlash(alloc, module, 16, 512, 64, false);
+    std.log.info("compare: not-cute flash batch_heads=8 seq=1024 head=64 causal=true", .{});
+    try compareFlash(alloc, module, 8, 1024, 64, true);
 }
 
 fn runOccupancyDemo() !void {
@@ -94,6 +144,7 @@ fn runFlashAttention(module: cuda.Module) !void {
     try runFlashCase(module, 2, 32, 32, 32 * 32 + 17, 32 * 32 + 19, 32 * 32 + 23, 32 * 32 + 29, true);
     try runFlashCase(module, 1, 17, 16, 17 * 16 + 3, 17 * 16 + 5, 17 * 16 + 7, 17 * 16 + 11, false);
     try runFlashCase(module, 3, 49, 16, 49 * 16, 49 * 16 + 13, 49 * 16 + 17, 49 * 16 + 19, true);
+    try runFlashCase(module, 1, 33, 64, 33 * 64 + 3, 33 * 64 + 5, 33 * 64 + 7, 33 * 64 + 11, false);
 }
 
 fn runFlashCase(
@@ -726,7 +777,7 @@ fn runFlashBenchmarkCase(
             .x = @intCast((seq_len + config.flash_block_m - 1) / config.flash_block_m),
             .y = @intCast(batch_heads),
         },
-        .block_dim = .{ .x = 32 },
+        .block_dim = .{ .x = config.flash_warps * 32 },
     };
     const args = .{
         d_q.ptr,
@@ -756,6 +807,195 @@ fn runFlashBenchmarkCase(
     var name_buf: [96]u8 = undefined;
     const name = try std.fmt.bufPrint(&name_buf, "flash_attention_fwd seq={} head={} causal={}", .{ seq_len, head_dim, causal });
     res.print(name);
+}
+
+fn emitCompareRecord(kernel_name: []const u8, implementation: []const u8, shape: []const u8, correct: bool, res: benchmark.BenchmarkResult, bytes: usize, flops: usize) void {
+    const gbps = if (res.throughput_gbps) |v| v else 0;
+    const tflops = if (res.tflops) |v| v else 0;
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    stdout_writer.interface.print(
+        "{{\"kernel\":\"{s}\",\"implementation\":\"{s}\",\"shape\":\"{s}\",\"correct\":{},\"mean_ms\":{d:.6},\"min_ms\":{d:.6},\"max_ms\":{d:.6},\"gbps\":{d:.6},\"tflops\":{d:.6},\"bytes\":{},\"flops\":{}}}\n",
+        .{ kernel_name, implementation, shape, correct, res.mean_ms, res.min_ms, res.max_ms, gbps, tflops, bytes, flops },
+    ) catch {};
+    stdout_writer.interface.flush() catch {};
+}
+
+fn emitCompareRecordWithError(kernel_name: []const u8, implementation: []const u8, shape: []const u8, correct: bool, res: benchmark.BenchmarkResult, bytes: usize, flops: usize, max_abs_error: f32) void {
+    const gbps = if (res.throughput_gbps) |v| v else 0;
+    const tflops = if (res.tflops) |v| v else 0;
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    stdout_writer.interface.print(
+        "{{\"kernel\":\"{s}\",\"implementation\":\"{s}\",\"shape\":\"{s}\",\"correct\":{},\"mean_ms\":{d:.6},\"min_ms\":{d:.6},\"max_ms\":{d:.6},\"gbps\":{d:.6},\"tflops\":{d:.6},\"bytes\":{},\"flops\":{},\"max_abs_error\":{d:.6}}}\n",
+        .{ kernel_name, implementation, shape, correct, res.mean_ms, res.min_ms, res.max_ms, gbps, tflops, bytes, flops, max_abs_error },
+    ) catch {};
+    stdout_writer.interface.flush() catch {};
+}
+
+fn compareVectorAdd(module: cuda.Module) !void {
+    const len = 10_000_000;
+    const bytes = len * @sizeOf(f32) * 3;
+    const d_a = try cuda.malloc(f32, len);
+    defer cuda.free(d_a);
+    const d_b = try cuda.malloc(f32, len);
+    defer cuda.free(d_b);
+    const d_out = try cuda.malloc(f32, len);
+    defer cuda.free(d_out);
+    var one: [1]f32 = .{1};
+    try cuda.memcpy(f32, d_a[0..1], &one, .host_to_device);
+    try cuda.memcpy(f32, d_b[0..1], &one, .host_to_device);
+
+    const kernel = try module.getFunction("vector_add");
+    const cfg = cuda.LaunchConfig{
+        .grid_dim = .{ .x = @intCast((len + 255) / 256) },
+        .block_dim = .{ .x = 256 },
+    };
+    const args = .{ d_a.ptr, d_b.ptr, d_out.ptr, len };
+    const res = try benchmark.runKernel(.{ .warmup_iters = 5, .iters = 20, .bytes_processed = bytes, .flops_processed = len }, kernel, cfg, args);
+    emitCompareRecord("vector_add", "not_cute", "n=10000000", true, res, bytes, len);
+}
+
+fn compareTranspose(module: cuda.Module) !void {
+    const rows = config.transpose_rows;
+    const cols = config.transpose_cols;
+    const len = rows * cols;
+    const bytes = len * @sizeOf(f32) * 2;
+    const d_input = try cuda.malloc(f32, len);
+    defer cuda.free(d_input);
+    const d_output = try cuda.malloc(f32, len);
+    defer cuda.free(d_output);
+    var one: [1]f32 = .{1};
+    try cuda.memcpy(f32, d_input[0..1], &one, .host_to_device);
+
+    const kernel = try module.getFunction("matrix_transpose");
+    const cfg = cuda.LaunchConfig{
+        .grid_dim = .{
+            .x = @intCast((cols + config.transpose_tile - 1) / config.transpose_tile),
+            .y = @intCast((rows + config.transpose_tile - 1) / config.transpose_tile),
+        },
+        .block_dim = .{ .x = config.transpose_tile, .y = config.transpose_tile },
+    };
+    const args = .{ d_input.ptr, d_output.ptr, rows, cols };
+    const res = try benchmark.runKernel(.{ .warmup_iters = 5, .iters = 20, .bytes_processed = bytes }, kernel, cfg, args);
+    emitCompareRecord("transpose", "not_cute", "130x70", true, res, bytes, 0);
+}
+
+fn compareReduction(module: cuda.Module) !void {
+    const len = 1000;
+    const block_size = 256;
+    const num_blocks = (len + block_size - 1) / block_size;
+    const bytes = len * @sizeOf(f32);
+    const d_in = try cuda.malloc(f32, len);
+    defer cuda.free(d_in);
+    const d_out = try cuda.malloc(f32, num_blocks);
+    defer cuda.free(d_out);
+    var one: [1]f32 = .{1};
+    try cuda.memcpy(f32, d_in[0..1], &one, .host_to_device);
+
+    const kernel = try module.getFunction("block_reduce_sum");
+    const cfg = cuda.LaunchConfig{
+        .grid_dim = .{ .x = @intCast(num_blocks) },
+        .block_dim = .{ .x = block_size },
+    };
+    const args = .{ d_in.ptr, d_out.ptr, len };
+    const res = try benchmark.runKernel(.{ .warmup_iters = 5, .iters = 20, .bytes_processed = bytes, .flops_processed = len }, kernel, cfg, args);
+    emitCompareRecord("reduction", "not_cute", "n=1000", true, res, bytes, len);
+}
+
+fn compareMma(module: cuda.Module) !void {
+    const a_len = config.mma_m * config.mma_k;
+    const b_len = config.mma_k * config.mma_n;
+    const c_len = config.mma_m * config.mma_n;
+    const bytes = (a_len + b_len) * @sizeOf(f16) + c_len * @sizeOf(f32) * 2;
+    const flops = 2 * config.mma_m * config.mma_n * config.mma_k;
+
+    const d_a = try cuda.malloc(f16, a_len);
+    defer cuda.free(d_a);
+    const d_b = try cuda.malloc(f16, b_len);
+    defer cuda.free(d_b);
+    const d_c = try cuda.malloc(f32, c_len);
+    defer cuda.free(d_c);
+    const d_d = try cuda.malloc(f32, c_len);
+    defer cuda.free(d_d);
+
+    const kernel = try module.getFunction("mma_matmul");
+    const cfg = cuda.LaunchConfig{ .grid_dim = .{ .x = 1 }, .block_dim = .{ .x = 32 } };
+    const args = .{ d_a.ptr, d_b.ptr, d_c.ptr, d_d.ptr, @as(f32, 1.0), @as(f32, 0.0) };
+    const res = try benchmark.runKernel(.{ .warmup_iters = 5, .iters = 20, .bytes_processed = bytes, .flops_processed = flops }, kernel, cfg, args);
+    emitCompareRecord("mma_gemm", "not_cute", "16x8x16", true, res, bytes, flops);
+}
+
+fn compareFlash(alloc: std.mem.Allocator, module: cuda.Module, comptime batch_heads: usize, comptime seq_len: usize, comptime head_dim: usize, comptime causal: bool) !void {
+    const stride = seq_len * head_dim;
+    const storage_len = batch_heads * stride;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    const q = try alloc.alloc(f16, storage_len);
+    defer alloc.free(q);
+    const k = try alloc.alloc(f16, storage_len);
+    defer alloc.free(k);
+    const v = try alloc.alloc(f16, storage_len);
+    defer alloc.free(v);
+    const o = try alloc.alloc(f32, storage_len);
+    defer alloc.free(o);
+    const expected = try alloc.alloc(f32, storage_len);
+    defer alloc.free(expected);
+    fillFlashInput(q, 3, 1, 0.125);
+    fillFlashInput(k, 5, 2, 0.0625);
+    fillFlashInput(v, 7, 3, 0.03125);
+    @memset(o, 0);
+    @memset(expected, 0);
+    computeFlashReferenceSlices(batch_heads, seq_len, head_dim, stride, stride, stride, stride, q, k, v, expected, scale, if (causal) 1 else 0);
+
+    const d_q = try cuda.malloc(f16, storage_len);
+    defer cuda.free(d_q);
+    const d_k = try cuda.malloc(f16, storage_len);
+    defer cuda.free(d_k);
+    const d_v = try cuda.malloc(f16, storage_len);
+    defer cuda.free(d_v);
+    const d_o = try cuda.malloc(f32, storage_len);
+    defer cuda.free(d_o);
+    try cuda.memcpy(f16, d_q, q, .host_to_device);
+    try cuda.memcpy(f16, d_k, k, .host_to_device);
+    try cuda.memcpy(f16, d_v, v, .host_to_device);
+    try cuda.memcpy(f32, d_o, o, .host_to_device);
+
+    const opts = flash.Options{
+        .batch_heads = batch_heads,
+        .seq_len = seq_len,
+        .head_dim = head_dim,
+        .q_stride = stride,
+        .k_stride = stride,
+        .v_stride = stride,
+        .o_stride = stride,
+        .scale = scale,
+        .causal = causal,
+    };
+    const kernel = try module.getFunction("flash_attention_fwd");
+    const cfg = cuda.LaunchConfig{
+        .grid_dim = .{
+            .x = @intCast((seq_len + config.flash_block_m - 1) / config.flash_block_m),
+            .y = @intCast(batch_heads),
+        },
+        .block_dim = .{ .x = config.flash_warps * 32 },
+    };
+    const args = .{ d_q.ptr, d_k.ptr, d_v.ptr, d_o.ptr, opts.seq_len, opts.head_dim, opts.q_stride, opts.k_stride, opts.v_stride, opts.o_stride, opts.scale, @as(u32, if (opts.causal) 1 else 0) };
+    const effective_seq = if (causal) (seq_len * (seq_len + 1)) / 2 else seq_len * seq_len;
+    const flops = batch_heads * (4 * effective_seq * head_dim);
+    const bytes = storage_len * (@sizeOf(f16) * 3 + @sizeOf(f32));
+    const res = try benchmark.runKernel(.{ .warmup_iters = 5, .iters = 20, .bytes_processed = bytes, .flops_processed = flops }, kernel, cfg, args);
+    try cuda.memcpy(f32, o, d_o, .device_to_host);
+
+    var max_abs_error: f32 = 0;
+    for (o, expected) |actual, want| {
+        max_abs_error = @max(max_abs_error, @abs(actual - want));
+    }
+    const correct = max_abs_error <= 0.02;
+
+    var shape_buf: [96]u8 = undefined;
+    const shape = try std.fmt.bufPrint(&shape_buf, "batch_heads={},seq={},head={},causal={}", .{ batch_heads, seq_len, head_dim, causal });
+    emitCompareRecordWithError("flash_attention", "not_cute", shape, correct, res, bytes, flops, max_abs_error);
 }
 
 fn runMmaMatmul(module: cuda.Module) !void {
@@ -934,6 +1174,35 @@ fn computeFlashReference(
     k: *const [batch_heads * k_stride]f16,
     v: *const [batch_heads * v_stride]f16,
     o: *[batch_heads * o_stride]f32,
+    scale: f32,
+    causal: u32,
+) void {
+    for (0..batch_heads) |batch| {
+        computeFlashReferenceOne(
+            seq_len,
+            head_dim,
+            q[batch * q_stride ..][0..q_stride],
+            k[batch * k_stride ..][0..k_stride],
+            v[batch * v_stride ..][0..v_stride],
+            o[batch * o_stride ..][0..o_stride],
+            scale,
+            causal,
+        );
+    }
+}
+
+fn computeFlashReferenceSlices(
+    comptime batch_heads: usize,
+    comptime seq_len: usize,
+    comptime head_dim: usize,
+    comptime q_stride: usize,
+    comptime k_stride: usize,
+    comptime v_stride: usize,
+    comptime o_stride: usize,
+    q: []const f16,
+    k: []const f16,
+    v: []const f16,
+    o: []f32,
     scale: f32,
     causal: u32,
 ) void {

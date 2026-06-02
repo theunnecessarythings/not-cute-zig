@@ -17,5 +17,7 @@ pub const mma_n = 8;
 pub const mma_k = 16;
 
 pub const flash_block_m = 16;
-pub const flash_block_n = 8;
-pub const flash_max_head_dim = 32;
+pub const flash_block_n = 16;
+pub const flash_mma_n = 8;
+pub const flash_warps = 2;
+pub const flash_max_head_dim = 64;

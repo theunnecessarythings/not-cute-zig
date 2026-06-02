@@ -70,15 +70,46 @@ The current flash-attention kernel computes single-head self-attention for row-m
 `Q/K/V/O` tensors with explicit element strides per flattened batch/head slice.
 It uses query CTAs, shared-memory K/V tiles, tensor cores for QK and PV,
 lane-parallel row max/sum reductions, causal masking, and online softmax state
-across K/V tiles. The current implementation supports `head_dim == 16` or `32`;
-the smoke test validates two padded causal `32x32` slices, and `benchmark` includes
-causal/non-causal flash timing runs for `seq_len` 32, 64, and 128.
+across K/V tiles. The flash tile shape is currently `block_m=16`, `block_n=16`
+with two warps per CTA, using two `m16n8k16` MMA subtiles per K/V tile. The current implementation supports
+`head_dim == 16`, `32`, or `64`; the smoke test validates padded causal/non-causal slices, and
+`benchmark` includes causal/non-causal flash timing runs for `seq_len` 32, 64,
+and 128.
 
 Run explicit non-smoke demos:
 
 ```sh
 zig build run -- benchmark
 ```
+
+Run CUDA Toolkit baselines against not-cute on Modal:
+
+```sh
+zig build -Dgpu=sm_86
+modal run modal_run.py --demo compare
+```
+
+`compare` prints JSONL records and a side-by-side summary table for not-cute and
+CUDA Toolkit baselines. Current baselines include CUDA C++ vector/transpose
+kernels, tiled and WMMA tensor-core CUDA flash-attention baselines with online
+softmax, a materialized cuBLAS attention path (`QK^T`, softmax, `PV`), CUB
+reduction, cuBLAS for the MMA/GEMM-shaped case, and PyTorch SDPA backends
+(`flash`, memory-efficient, and math where available). The flash sweep includes
+smoke shapes and larger supported workloads up to
+`batch_heads=8, seq_len=1024, head_dim=64`.
+
+Profile the focused large flash case with Nsight Compute on Modal:
+
+```sh
+zig build -Dgpu=sm_86
+modal run modal_run.py --demo profile-flash
+```
+
+`profile-flash` runs `ncu` against only `flash_attention_fwd` for
+`batch_heads=8, seq_len=1024, head_dim=64, causal=true`, collecting speed-of-light,
+occupancy, scheduler, warp-state, and memory workload sections. Some hosted GPU
+runtimes restrict profiler injection; if `ncu` fails, the Modal wrapper prints
+the profiler error and runs the focused flash benchmark without profiling.
 
 ## Modal
 

@@ -21,6 +21,13 @@ zig build run -- all
 
 `benchmark` is an explicit demo. It is not part of the deterministic `all` smoke path.
 
+CUDA-vs-not-cute comparison runs require the CUDA devel image on Modal:
+
+```sh
+zig build -Dgpu=sm_86
+modal run modal_run.py --demo compare
+```
+
 ## Public API
 
 The supported package entrypoint is `src/not_cute.zig`, imported by downstream projects as `not-cute`.
